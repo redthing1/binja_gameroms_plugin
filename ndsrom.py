@@ -50,6 +50,8 @@ class NDSView(BinaryView):
 			self.arm9_entry_addr = struct.unpack("<L", self.hdr[0x24:0x28])[0]
 			self.arm9_load_addr = struct.unpack("<L", self.hdr[0x28:0x2C])[0]
 			self.arm9_size = struct.unpack("<L", self.hdr[0x2C:0x30])[0]
+
+			# create a segment to map the arm9 rom to the correct load address
 			self.add_auto_segment(
 			  self.arm9_load_addr, self.arm9_size, self.arm9_offset, self.arm9_size,
 			  SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable
@@ -69,6 +71,8 @@ class NDSView(BinaryView):
 			self.arm7_entry_addr = struct.unpack("<L", self.hdr[0x34:0x38])[0]
 			self.arm7_load_addr = struct.unpack("<L", self.hdr[0x38:0x3C])[0]
 			self.arm7_size = struct.unpack("<L", self.hdr[0x3C:0x40])[0]
+
+			# create a segment to map the arm7 rom to the correct load address
 			self.add_auto_segment(
 			  self.arm7_load_addr, self.arm7_size, self.arm7_offset, self.arm7_size,
 			  SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable
