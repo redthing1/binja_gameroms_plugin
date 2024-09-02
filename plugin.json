@@ -1,7 +1,7 @@
 {
   "plugin": {
-    "name": "Binja GBA",
-    "description": "GameBoy Advance ROM loader for Binary Ninja",
+    "name": "Game ROM Loader",
+    "description": "Game ROM Loader for Binary Ninja",
     "type": [
       "core",
       "architecture",
@@ -9,7 +9,7 @@
       "ui"
     ],
     "version": "0.0.1",
-    "author": "redthing1, Sideway",
+    "author": "redthing1",
     "minimumBinaryNinjaVersion": 3164
   }
 }

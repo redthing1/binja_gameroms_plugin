@@ -1,3 +1,6 @@
+# adapted from: https://github.com/SiD3W4y/binja-toolkit/blob/master/gbarom.py
+# writeup: https://sideway.re/Reverse-Engineering-alttp-GBA-ep1/
+
 from binaryninja import *
 import struct
 import os
@@ -6,7 +9,7 @@ import re
 
 class GBAView(BinaryView):
     name = "GBA"
-    long_name = "GBA ROM"
+    long_name = "GameBoy Advance"
 
     def __init__(self, data):
         BinaryView.__init__(self, parent_view=data, file_metadata=data.file)
