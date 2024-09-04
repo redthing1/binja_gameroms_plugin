@@ -2,6 +2,7 @@
 # writeup: https://sideway.re/Reverse-Engineering-alttp-GBA-ep1/
 
 from binaryninja import *
+from binaryninja.log import Logger
 import struct
 import os
 import re
@@ -31,8 +32,9 @@ class GBAView(BinaryView):
         return True
 
     def init(self):
+        self.log = self.create_logger("GBA")
         try:
-            # Adding segments
+            # Add GBA segments
             rwx_mask = (
                 SegmentFlag.SegmentReadable
                 | SegmentFlag.SegmentWritable
@@ -250,10 +252,16 @@ class GBAView(BinaryView):
 
             # Entry point
             self.add_entry_point(0x8000000)
+
+            self.log_info("GBA ROM loaded successfully")
+
             return True
         except:
             log_error(traceback.format_exc())
             return False
-    
+
     def perform_get_address_size(self):
-        return 4 # GBA's ARM7TDMI is 32-bit
+        return 4  # GBA's ARM7TDMI is 32-bit
+
+
+GBAView.register()

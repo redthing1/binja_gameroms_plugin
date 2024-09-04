@@ -4,9 +4,7 @@ from binaryninja import *
 
 import struct
 import traceback
-import logging
 
-log = logging.getLogger("NDS")
 
 def crc16(data):
     crc = 0xFFFF
@@ -26,6 +24,7 @@ class NDSView(BinaryView):
 
     def __init__(self, parent):
         BinaryView.__init__(self, file_metadata=parent.file, parent_view=parent)
+        self.log = self.create_logger("NDS")
         self.raw = parent
 
     @staticmethod
@@ -67,12 +66,12 @@ class NDSView(BinaryView):
             self.define_auto_symbol(
                 Symbol(SymbolType.FunctionSymbol, self.arm9_entry_addr, "_start9")
             )
-            log.info(
+            self.log.log_info(
                 f"ARM9 entry=0x{self.arm9_entry_addr:08x}, load=0x{self.arm9_load_addr:08x}, size=0x{self.arm9_size:08x}, offset=0x{self.arm9_offset:08x}"
             )
             return True
         except:
-            log.error(traceback.format_exc())
+            self.log.log_error(traceback.format_exc())
             return False
 
     def init_arm7(self):
@@ -96,12 +95,12 @@ class NDSView(BinaryView):
             self.define_auto_symbol(
                 Symbol(SymbolType.FunctionSymbol, self.arm7_entry_addr, "_start7")
             )
-            log.info(
+            self.log.log_info(
                 f"ARM7 entry=0x{self.arm7_entry_addr:08x}, load=0x{self.arm7_load_addr:08x}, size=0x{self.arm7_size:08x}, offset=0x{self.arm7_offset:08x}"
             )
             return True
         except:
-            log.error(traceback.format_exc())
+            self.log.log_error(traceback.format_exc())
             return False
 
     def perform_is_executable(self):
@@ -115,3 +114,6 @@ class NDSView(BinaryView):
 
     def init(self):
         return self.init_arm9() and self.init_arm7()
+
+
+NDSView.register()
