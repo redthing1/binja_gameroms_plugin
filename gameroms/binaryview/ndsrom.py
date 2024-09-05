@@ -19,19 +19,27 @@ class NDSView(BinaryView):
     @staticmethod
     def is_valid_for_data(data):
         try:
-            rom_data = data.read(0, len(data))
+            # read the first 0x160 bytes
+            # log_info("Checking if NDS ROM is valid")
+            data.seek(0)
+            header_region = data.read(0, 0x160)
+            rom_data = io.BytesIO(header_region)
             return NDSRomReader.is_valid(rom_data)
         except:
             return False
 
     def init(self):
         try:
-            rom_data = self.raw.read(0, len(self.raw))
+            # read the first 0x160 bytes
+            self.raw.seek(0)
+            self.log.log_info("Reading NDS ROM")
+            header_region = self.raw.read(0, 0x160)
+            rom_data = io.BytesIO(header_region)
             self.nds_rom = NDSRomReader.read(rom_data)
             self.arch = Architecture["armv7"]
             self.platform = Architecture["armv7"].standalone_platform
 
-            self._init_arm9(try_decompress=True)
+            self._init_arm9(try_decompress=False)
             self._init_arm7()
             # self._load_arm9_overlays()
 
