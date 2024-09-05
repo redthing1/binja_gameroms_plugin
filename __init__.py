@@ -1,4 +1,3 @@
 from binaryninja import *
 
-from . import gbarom
-from . import ndsrom
+from .gameroms.binaryview import gbarom, ndsrom
