@@ -250,10 +250,15 @@ class GBAView(BinaryView):
             self.define_auto_symbol(Symbol(SymbolType.DataSymbol, 0x4000300, "POSTFLG"))
             self.define_auto_symbol(Symbol(SymbolType.DataSymbol, 0x4000301, "HALTCNT"))
 
-            # Entry point
-            self.add_entry_point(0x8000000)
+            # entry point
+            entry_point_addr = 0x8000000
+            self.add_entry_point(entry_point_addr)
+            # define a symbol for the entry point
+            self.define_auto_symbol(
+                Symbol(SymbolType.FunctionSymbol, entry_point_addr, "_start")
+            )
 
-            self.log_info("GBA ROM loaded successfully")
+            self.log.log_info("GBA ROM loaded successfully")
 
             return True
         except:
