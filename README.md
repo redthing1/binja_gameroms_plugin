@@ -7,7 +7,7 @@ Binary Ninja loader for some game ROMs.
 
 + [x] load GBA (GameBoy Advance) ROMs (`armv4`)
 + [x] load NDS (Nintendo DS) ROMs (`armv4`/`armv5`)
-+ [ ] planned: PSP (PlayStation Portable) EBOOT (`mips`)
++ [x] load: PSP (PlayStation Portable) ELF (`mipsel32`)
 + [ ] planned: Wii (Nintendo Wii) binary (`powerpc`)
 
 ## Credits
