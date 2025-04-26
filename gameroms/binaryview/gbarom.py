@@ -1,6 +1,7 @@
 import struct
 import traceback
 from typing import Optional, Dict, Tuple, List
+from dataclasses import dataclass
 
 from binaryninja import (
     BinaryView,
@@ -17,6 +18,36 @@ from binaryninja import (
     log_info,
 )
 from binaryninja.log import Logger
+
+# --- gba header constants ---
+# offsets within the gba header
+GBA_NINTENDO_LOGO_OFFSET = 0x04
+GBA_NINTENDO_LOGO_SIZE = 0x9C  # 156 bytes
+GBA_GAME_TITLE_OFFSET = 0xA0
+GBA_GAME_TITLE_SIZE = 12
+GBA_GAME_CODE_OFFSET = 0xAC
+GBA_GAME_CODE_SIZE = 4
+GBA_MAKER_CODE_OFFSET = 0xB0
+GBA_MAKER_CODE_SIZE = 2
+GBA_FIXED_VALUE_OFFSET = 0xB2  # Should be 0x96
+GBA_MAIN_UNIT_CODE_OFFSET = 0xB3
+GBA_DEVICE_TYPE_OFFSET = 0xB4
+GBA_SOFTWARE_VERSION_OFFSET = 0xBC
+GBA_HEADER_CHECKSUM_OFFSET = 0xBD
+GBA_HEADER_MIN_SIZE = 0xC0  # Minimum size to check logo magic
+
+
+# --- dataclass for gba header ---
+@dataclass
+class GBAHeader:
+    """Represents parsed information from the GBA ROM header."""
+
+    game_title: str = ""
+    game_code: str = ""
+    maker_code: str = ""
+    software_version: int = 0
+    # Add other fields if needed later
+
 
 # --- gba hardware definitions ---
 
@@ -223,6 +254,7 @@ class GBAView(BinaryView):
         self.log: Logger = self.create_logger("GBA")  # use "GBA" logger name.
         self._created_tag_types: Dict[str, TagType] = {}  # cache for created TagTypes.
         self.rom_size = self.raw.length  # get rom size from the raw view
+        self.gba_header: Optional[GBAHeader] = None  # store parsed header info
 
         # set architecture and platform (gba uses armv4t, covered by armv7 profile)
         try:
@@ -253,27 +285,27 @@ class GBAView(BinaryView):
             true if the data is likely a gba rom, false otherwise.
         """
         # check header size
-        if data.length < 0xC0:
+        if data.length < GBA_HEADER_MIN_SIZE:
             return False
 
-        # check nintendo logo magic byte at 0xb2
+        # check nintendo logo fixed value byte at 0xb2
         try:
-            magic_byte = data.read(0xB2, 1)
+            magic_byte = data.read(GBA_FIXED_VALUE_OFFSET, 1)
             if magic_byte == b"\x96":
-                log_info("[GBA] validation: found nintendo logo magic byte.")
+                log_info("[GBA] validation: found fixed value 0x96 in header.")
                 return True
             else:
-                # log_warn("[GBA] validation: nintendo logo magic byte mismatch.") # Can be noisy
+                # log_warn("[GBA] validation: fixed value 0x96 mismatch.") # Can be noisy
                 return False
         except Exception as e:
             # Use a generic logger name here as self.log isn't available in classmethod
-            log_error(f"[GBA Validation] error reading magic byte: {e}")
+            log_error(f"[GBA Validation] error reading fixed value byte: {e}")
             return False
 
         # could add header checksum validation here if needed
-        # header_checksum = data.read(0xBD, 1)[0]
+        # header_checksum = data.read(GBA_HEADER_CHECKSUM_OFFSET, 1)[0]
         # calculated = 0
-        # for i in range(0xA0, 0xBD):
+        # for i in range(GBA_GAME_TITLE_OFFSET, GBA_HEADER_CHECKSUM_OFFSET):
         #     calculated = calculated - data.read(i, 1)[0]
         # calculated = (calculated - 0x19) & 0xFF
         # if header_checksum != calculated:
@@ -281,6 +313,33 @@ class GBAView(BinaryView):
         #     # return False # Decide if strict check is needed
 
     # --- helper methods ---
+
+    def _parse_header(self) -> bool:
+        """parses key fields from the gba header."""
+        self.log.log_info("parsing gba header...")
+        if self.raw.length < GBA_HEADER_MIN_SIZE:
+            self.log.log_error("rom too small for gba header.")
+            return False
+        try:
+            title_bytes = self.raw.read(GBA_GAME_TITLE_OFFSET, GBA_GAME_TITLE_SIZE)
+            game_code_bytes = self.raw.read(GBA_GAME_CODE_OFFSET, GBA_GAME_CODE_SIZE)
+            maker_code_bytes = self.raw.read(GBA_MAKER_CODE_OFFSET, GBA_MAKER_CODE_SIZE)
+            sw_version_byte = self.raw.read(GBA_SOFTWARE_VERSION_OFFSET, 1)
+
+            self.gba_header = GBAHeader(
+                game_title=title_bytes.decode("ascii", errors="replace").rstrip("\x00"),
+                game_code=game_code_bytes.decode("ascii", errors="replace"),
+                maker_code=maker_code_bytes.decode("ascii", errors="replace"),
+                software_version=sw_version_byte[0] if sw_version_byte else 0,
+            )
+            self.log.log_info(
+                f"game title: '{self.gba_header.game_title}', code: {self.gba_header.game_code}, maker: {self.gba_header.maker_code}"
+            )
+            return True
+        except Exception as e:
+            self.log.log_error(f"failed to parse gba header fields: {e}")
+            self.gba_header = None
+            return False
 
     def _define_tag_types(self):
         """
@@ -515,6 +574,8 @@ class GBAView(BinaryView):
             self.log.log_info("starting gba rom loading process...")
 
             # --- main loading steps ---
+            if not self._parse_header():
+                return False  # Parse header first
             self._define_tag_types()
             self._map_memory_regions()
             self._define_sections()  # Define sections after segments are mapped
