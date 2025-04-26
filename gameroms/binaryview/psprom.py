@@ -1,6 +1,7 @@
 import struct
 import traceback
 from typing import Optional, Dict, Tuple, List
+from dataclasses import dataclass
 
 # import necessary binary ninja types
 from binaryninja import (
@@ -12,7 +13,7 @@ from binaryninja import (
     Tag,
     Platform,
     Architecture,
-    SectionSemantics,  # Added for section definitions
+    SectionSemantics,
     log_error,
     log_warn,
     log_info,
@@ -71,13 +72,49 @@ SHF_WRITE = 0x1  # Writable
 SHF_ALLOC = 0x2  # Occupies memory during execution
 SHF_EXECINSTR = 0x4  # Executable
 
+
+# --- dataclasses for elf structures ---
+@dataclass
+class ELFHeader32:
+    """Represents the parsed 32-bit ELF header."""
+
+    e_ident: bytes = b"\x00" * 16
+    e_type: int = 0
+    e_machine: int = 0
+    e_version: int = 0
+    e_entry: int = 0
+    e_phoff: int = 0
+    e_shoff: int = 0
+    e_flags: int = 0
+    e_ehsize: int = 0
+    e_phentsize: int = 0
+    e_phnum: int = 0
+    e_shentsize: int = 0
+    e_shnum: int = 0
+    e_shstrndx: int = 0
+
+
+@dataclass
+class ProgramHeader32:
+    """Represents a parsed 32-bit Program Header entry."""
+
+    p_type: int = 0
+    p_offset: int = 0
+    p_vaddr: int = 0
+    p_paddr: int = 0
+    p_filesz: int = 0
+    p_memsz: int = 0
+    p_flags: int = 0
+    p_align: int = 0
+
+
 # --- psp hardware definitions ---
 
 # dictionary mapping tag type names (proper case) to icons
 # used by _get_or_create_tag_type and _define_reg_with_tag
 PSP_TAG_TYPES: Dict[str, str] = {
     "Memory Region": "🗺️",
-    "Memory Management": "🐏",
+    "Memory Management": "🧠",
     "System Control": "⚙️",
     "Interrupts": "⚡",
     "Profiler": "⏱️",
@@ -448,7 +485,7 @@ class PSPView(BinaryView):
         )
         self.log: Logger = self.create_logger("PSP")  # use "PSP" logger name.
         self._created_tag_types: Dict[str, TagType] = {}  # cache for created TagTypes.
-        # do *not* initialize self.entry_point here. it's handled in init().
+        self.elf_header: Optional[ELFHeader32] = None  # store parsed elf header
 
     @classmethod
     def is_valid_for_data(cls, data: BinaryView) -> bool:
@@ -534,7 +571,57 @@ class PSPView(BinaryView):
             )
             return False
 
-    # --- helper methods (adopted from nds/gba loaders) ---
+    # --- helper methods ---
+
+    def _parse_elf_header(self) -> bool:
+        """
+        parses the elf header from the raw data and stores it in self.elf_header.
+        returns true on success, false on failure.
+        """
+        self.log.log_info("parsing elf header...")
+        if self.raw.length < ELF_HEADER_SIZE:
+            self.log.log_error("file is too small for elf header.")
+            return False
+
+        header_bytes = self.raw.read(0, ELF_HEADER_SIZE)
+        if len(header_bytes) < ELF_HEADER_SIZE:
+            self.log.log_error("could not read full elf header.")
+            return False
+
+        try:
+            header_values = struct.unpack(ELF_HEADER_FORMAT, header_bytes)
+            self.elf_header = ELFHeader32(
+                *header_values
+            )  # unpack values into dataclass fields
+            # log key fields after successful parsing
+            self.log.log_info(f"elf entry point: 0x{self.elf_header.e_entry:08x}")
+            self.log.log_info(
+                f"program header offset: 0x{self.elf_header.e_phoff:x}, count: {self.elf_header.e_phnum}, entry size: {self.elf_header.e_phentsize}"
+            )
+            self.log.log_info(
+                f"section header offset: 0x{self.elf_header.e_shoff:x}, count: {self.elf_header.e_shnum}, entry size: {self.elf_header.e_shentsize}, strtab index: {self.elf_header.e_shstrndx}"
+            )
+            return True
+        except struct.error as unpack_err:
+            self.log.log_error(f"failed to unpack elf header: {unpack_err}")
+            self.log.log_error(
+                f"elf header format string used: '{ELF_HEADER_FORMAT}' ({struct.calcsize(ELF_HEADER_FORMAT)} bytes)"
+            )
+            self.elf_header = None  # ensure it's None on failure
+            return False
+        except Exception as e:
+            self.log.log_error(f"unexpected error parsing elf header: {e}")
+            self.elf_header = None
+            return False
+
+    def _define_tag_types(self):
+        """
+        defines and caches all necessary tag types used by this view.
+        iterates through the global PSP_TAG_TYPES dictionary.
+        """
+        self.log.log_info("defining psp hardware tag types...")
+        for name, icon in PSP_TAG_TYPES.items():
+            self._get_or_create_tag_type(name, icon)
 
     def _get_or_create_tag_type(self, name: str, icon: str) -> Optional[TagType]:
         """
@@ -615,12 +702,234 @@ class PSPView(BinaryView):
                 f"failed processing register '{name}' at 0x{address:x}: {e}"
             )
 
-    def _map_elf_sections(
-        self, e_shoff: int, e_shnum: int, e_shentsize: int, e_shstrndx: int
-    ):
+    def _map_memory_regions(self):
+        """maps the core psp hardware memory regions (ram, vram, io, etc.)."""
+        self.log.log_info("mapping core psp hardware memory regions...")
+
+        # helper function to add segment and associated tag/comment.
+        def add_memory_region(
+            addr, size, perms, name, tag_name="Memory Region", tag_icon="🗺️"
+        ):
+            self.log.log_info(f"  mapping {name}: addr=0x{addr:08x}, size=0x{size:x}")
+            # add the segment with zero offset/length from the file (it's ram or io).
+            self.add_auto_segment(addr, size, 0, 0, perms)
+            # get the tag type (use proper case name).
+            tag_type = self._get_or_create_tag_type(tag_name, tag_icon)
+            if tag_type:
+                # add tag at the start of the region.
+                self.add_tag(addr, tag_type, data=f"{name} Start")
+            # add comment at the start of the region (proper case allowed here).
+            self.set_comment_at(addr, f"{name} ({size // 1024}KB)")
+
+        # sc cpu scratchpad (16kb) - fast internal ram.
+        add_memory_region(0x00010000, 0x4000, self.RWX_FLAGS, "SC CPU Scratchpad")
+
+        # vram / edram (8mb) - video ram. usually rw.
+        add_memory_region(0x04000000, 0x800000, self.RW_FLAGS, "VRAM / EDRAM")
+
+        # main ram (assume 32mb for psp-1000 default).
+        # TODO: potentially read SYSCON_RAMSIZE (0x1C100040) to determine size dynamically?
+        main_ram_base = 0x08000000
+        main_ram_size = 0x02000000  # 32mb default
+        add_memory_region(
+            main_ram_base,
+            main_ram_size,
+            self.RWX_FLAGS,
+            f"Main RAM ({main_ram_size // (1024*1024)}MB)",
+        )
+
+        # i/o ports - map the main known blocks as rw segments. tag as hardware registers.
+        add_memory_region(
+            0x1C000000,
+            0x01000000,
+            self.RW_FLAGS,
+            "I/O Ports Block 1",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )  # 16mb (covers 1cxxxxxx)
+        add_memory_region(
+            0x1D000000,
+            0x02000000,
+            self.RW_FLAGS,
+            "I/O Ports Block 2",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )  # 32mb (covers 1dxxxxxx, 1exxxxxx)
+        add_memory_region(
+            0x1FF00000,
+            0x00000A00,
+            self.RW_FLAGS,
+            "NAND DMA IO Buffers",
+            tag_name="NAND Flash",
+            tag_icon="💾",
+        )  # ~2.5kb
+
+        # shared ram (2mb) - contains exception vectors.
+        add_memory_region(0x1FC00000, 0x200000, self.RWX_FLAGS, "Shared RAM")
+
+        # boot rom (16kb standard mips size) - mapped via kseg1 uncached alias.
+        boot_rom_base = 0xBFC00000  # kseg1 virtual address for physical 0x1fc00000
+        boot_rom_size = 0x4000  # 16kb
+        # map as zero-filled rx segment at the virtual address.
+        add_memory_region(
+            boot_rom_base, boot_rom_size, self.RX_FLAGS, "Boot ROM (Virtual Alias)"
+        )
+        # define common mips boot vectors (relative to boot_rom_base). use proper case for symbol names.
+        self.define_auto_symbol(
+            Symbol(SymbolType.DataSymbol, boot_rom_base + 0x000, "Reset_Vector")
+        )
+        self.define_auto_symbol(
+            Symbol(
+                SymbolType.DataSymbol,
+                boot_rom_base + 0x100,
+                "TLB_Refill_Vector_BEV0",
+            )
+        )  # utlb miss
+        self.define_auto_symbol(
+            Symbol(
+                SymbolType.DataSymbol,
+                boot_rom_base + 0x180,
+                "Cache_Error_Vector_BEV0",
+            )
+        )  # cache error / xtlb miss
+        self.define_auto_symbol(
+            Symbol(
+                SymbolType.DataSymbol,
+                boot_rom_base + 0x200,
+                "General_Exception_Vector_BEV0",
+            )
+        )
+
+    def _map_elf_segments(self):
+        """
+        maps the loadable program segments from the elf header using virtual addresses.
+        relies on self.elf_header being populated.
+        """
+        if not self.elf_header:
+            self.log.log_error("cannot map elf segments, elf header not parsed.")
+            return
+
+        e_phoff = self.elf_header.e_phoff
+        e_phnum = self.elf_header.e_phnum
+        e_phentsize = self.elf_header.e_phentsize
+
+        program_headers_exist = e_phoff > 0 and e_phnum > 0
+        self.log.log_info(f"mapping elf program segments (if any)...")
+
+        if not program_headers_exist:
+            self.log.log_info("no program headers found in elf file to map.")
+            return
+
+        # validate header info again before looping
+        if e_phoff + e_phnum * e_phentsize > self.raw.length:
+            self.log.log_error(
+                f"program headers exceed file size. cannot map segments."
+            )
+            return
+        if e_phentsize != P_HEADER_SIZE:
+            self.log.log_error(
+                f"unexpected program header entry size. cannot map segments."
+            )
+            return
+
+        for i in range(e_phnum):
+            ph_offset_in_file = e_phoff + i * e_phentsize
+            ph_bytes = self.raw.read(ph_offset_in_file, P_HEADER_SIZE)
+            if len(ph_bytes) < P_HEADER_SIZE:
+                self.log.log_error(
+                    f"could not read full program header {i} at offset 0x{ph_offset_in_file:x}."
+                )
+                continue
+
+            try:
+                ph = ProgramHeader32(*struct.unpack(P_HEADER_FORMAT, ph_bytes))
+            except struct.error as unpack_err:
+                self.log.log_error(f"failed to unpack program header {i}: {unpack_err}")
+                continue
+
+            if ph.p_type == PT_LOAD:
+                # --- use virtual address (p_vaddr) for mapping ---
+                map_addr = ph.p_vaddr
+                map_size = ph.p_memsz
+                file_offset = ph.p_offset
+                file_len = ph.p_filesz
+
+                # validate segment parameters.
+                if map_size == 0:
+                    self.log.log_warn(
+                        f"skipping pt_load segment {i} at 0x{map_addr:08x} with zero memory size."
+                    )
+                    continue
+                if file_len > map_size:
+                    self.log.log_warn(
+                        f"pt_load segment {i} file size (0x{file_len:x}) > memory size (0x{map_size:x}). clamping file length."
+                    )
+                    file_len = map_size
+                if file_offset + file_len > self.raw.length:
+                    self.log.log_error(
+                        f"pt_load segment {i} data (offset=0x{file_offset:x}, len=0x{file_len:x}) exceeds file bounds (len={self.raw.length}). skipping segment."
+                    )
+                    continue
+
+                # determine segment permissions from elf flags
+                segment_flags_value = 0  # use integer for accumulation
+                perm_str = ""
+                if ph.p_flags & PF_R:
+                    segment_flags_value |= SegmentFlag.SegmentReadable
+                    perm_str += "r"
+                else:
+                    perm_str += "-"
+                if ph.p_flags & PF_W:
+                    segment_flags_value |= SegmentFlag.SegmentWritable
+                    perm_str += "w"
+                else:
+                    perm_str += "-"
+                if ph.p_flags & PF_X:
+                    segment_flags_value |= SegmentFlag.SegmentExecutable
+                    perm_str += "x"
+                else:
+                    perm_str += "-"
+
+                self.log.log_info(
+                    f"  mapping segment {i}: vaddr=0x{map_addr:08x}, memsize=0x{map_size:x}, "  # Log vaddr
+                    f"fileoffset=0x{file_offset:x}, filesize=0x{file_len:x}, flags={perm_str}"
+                )
+
+                # add the segment using the virtual address
+                self.add_auto_segment(
+                    map_addr, map_size, file_offset, file_len, segment_flags_value
+                )
+                self.set_comment_at(map_addr, f"ELF Segment {i} (LOAD)")
+
+                # add comment for bss section if it exists.
+                if map_size > file_len:
+                    bss_start = map_addr + file_len
+                    bss_size = map_size - file_len
+                    if bss_start < map_addr + map_size:
+                        self.set_comment_at(
+                            bss_start,
+                            f"ELF Segment {i} BSS Start (Size: 0x{bss_size:x})",
+                        )
+            else:
+                self.log.log_info(
+                    f"  skipping segment {i}: type=0x{ph.p_type:x} (not pt_load)"
+                )
+
+    def _map_elf_sections(self):
         """
         parses the elf section header table and defines sections in binary ninja.
+        relies on self.elf_header being populated.
         """
+        if not self.elf_header:
+            self.log.log_error("cannot map elf sections, elf header not parsed.")
+            return
+
+        # extract necessary info from stored header
+        e_shoff = self.elf_header.e_shoff
+        e_shnum = self.elf_header.e_shnum
+        e_shentsize = self.elf_header.e_shentsize
+        e_shstrndx = self.elf_header.e_shstrndx
+
         self.log.log_info("mapping elf sections...")
         if e_shoff == 0 or e_shnum == 0 or e_shentsize == 0:
             self.log.log_warn(
@@ -775,12 +1084,21 @@ class PSPView(BinaryView):
                 else:
                     # read-only data
                     section_semantics = SectionSemantics.ReadOnlyDataSectionSemantics
-                    section_type_str = "ReadOnlyData"
+                    section_type_str = "ReadOnlyData"  # e.g., .rodata
             # could add checks for SHT_NOTE, SHT_SYMTAB etc. if needed
 
+            # log the determined semantics
             self.log.log_info(
                 f"  adding section '{section_name}': addr=0x{sh_addr:08x}, size=0x{sh_size:x}, type={sh_type}, flags=0x{sh_flags:x}, semantics={section_semantics.name}"
             )
+            # add extra log if a common code section name doesn't have expected semantics
+            if (
+                section_name.startswith(".text")
+                and section_semantics != SectionSemantics.ReadOnlyCodeSectionSemantics
+            ):
+                self.log.log_warn(
+                    f"section '{section_name}' does not have ReadOnlyCodeSectionSemantics despite its name."
+                )
 
             # add the section using add_auto_section
             # note: align, entry_size, linked_section, info_section, info_data are directly from header
@@ -805,6 +1123,61 @@ class PSPView(BinaryView):
                     f"failed to add section '{section_name}' at 0x{sh_addr:x}: {sec_err}"
                 )
 
+    def _define_io_registers(self):
+        """defines symbols and tags for known psp i/o registers."""
+        self.log.log_info("defining psp i/o registers...")
+        for addr, name, tag_name, desc in PSP_IO_REGISTERS:
+            # get the icon for the tag type, providing a default if needed
+            icon = PSP_TAG_TYPES.get(tag_name, "🔩")  # default to generic hardware icon
+            self._define_reg_with_tag(addr, name, tag_name, icon, desc)
+
+    def _define_entry_point(self):
+        """
+        defines the entry point symbol and function based on the parsed elf header.
+        relies on self.elf_header being populated.
+        """
+        if not self.elf_header:
+            self.log.log_error("cannot define entry point, elf header not parsed.")
+            return
+
+        entry_point = self.elf_header.e_entry
+        self.log.log_info(f"adding entry point at 0x{entry_point:08x}")
+
+        # validate entry point address before adding.
+        # check if it falls within a mapped segment (elf segment or hardware region).
+        segment_at_entry = self.get_segment_at(entry_point)
+        if segment_at_entry:
+            self.log.log_info(
+                f"entry point 0x{entry_point:08x} is within segment starting at 0x{segment_at_entry.start:08x}."
+            )
+            # check if the segment is executable.
+            if segment_at_entry.executable:
+                # use the api to add the entry point.
+                self.add_entry_point(entry_point)
+                # use proper case for standard symbol name
+                self.define_auto_symbol(
+                    Symbol(SymbolType.FunctionSymbol, entry_point, "_start")
+                )
+                # attempt to define a function at the entry point for analysis.
+                try:
+                    self.add_function(entry_point)
+                except Exception as func_err:
+                    # log warning if function definition fails.
+                    self.log.log_warn(
+                        f"could not define function at entry point 0x{entry_point:08x}: {func_err}"
+                    )
+            else:
+                self.log.log_warn(
+                    f"entry point 0x{entry_point:08x} is in a non-executable segment. defining data symbol instead."
+                )
+                self.define_auto_symbol(
+                    Symbol(SymbolType.DataSymbol, entry_point, "_entry_point_data")
+                )
+        else:
+            self.log.log_error(
+                f"entry point 0x{entry_point:08x} is not within any mapped segment. cannot set entry point or define symbol."
+            )
+
     # --- main initialization logic ---
 
     def init(self) -> bool:
@@ -820,355 +1193,15 @@ class PSPView(BinaryView):
         try:
             self.log.log_info("starting psp elf loading process...")
 
-            # --- parse elf header ---
-            # read header bytes (already validated for size in is_valid_for_data).
-            header_bytes = self.raw.read(0, ELF_HEADER_SIZE)
-            if len(header_bytes) < ELF_HEADER_SIZE:
-                self.log.log_error("could not read full elf header in init.")
-                return False  # should not happen if is_valid_for_data passed.
-
-            # declare local variables for header fields
-            local_entry_point = 0
-            e_phoff = 0
-            e_phnum = 0
-            e_phentsize = 0
-            e_shoff = 0
-            e_shnum = 0
-            e_shentsize = 0
-            e_shstrndx = 0
-            try:
-                # unpack all header fields using the *corrected* format string
-                (
-                    ident_bytes,
-                    e_type,
-                    e_machine,
-                    e_version,
-                    local_entry_point,
-                    e_phoff,
-                    e_shoff,
-                    e_flags,
-                    e_ehsize,
-                    e_phentsize,
-                    e_phnum,
-                    e_shentsize,
-                    e_shnum,
-                    e_shstrndx,
-                ) = struct.unpack(ELF_HEADER_FORMAT, header_bytes)
-                # log info after successful unpacking
-                self.log.log_info(f"elf entry point: 0x{local_entry_point:08x}")
-                self.log.log_info(
-                    f"program header offset: 0x{e_phoff:x}, count: {e_phnum}, entry size: {e_phentsize}"
-                )
-                self.log.log_info(
-                    f"section header offset: 0x{e_shoff:x}, count: {e_shnum}, entry size: {e_shentsize}, strtab index: {e_shstrndx}"
-                )
-            except struct.error as unpack_err:
-                # this is where the ValueError likely originated
-                self.log.log_error(
-                    f"failed to unpack elf header (check format string and header size?): {unpack_err}"
-                )
-                self.log.log_error(
-                    f"elf header format string used: '{ELF_HEADER_FORMAT}' ({struct.calcsize(ELF_HEADER_FORMAT)} bytes)"
-                )
+            # --- main loading steps ---
+            if not self._parse_elf_header():
                 return False
-
-            # --- validate header values ---
-            # check if program header offset and count are reasonable.
-            program_headers_exist = e_phoff > 0 and e_phnum > 0
-            if not program_headers_exist:
-                self.log.log_warn(
-                    "elf has no program headers (e_phoff or e_phnum is zero)."
-                )
-                # continue loading memory map, but no elf segments will be loaded.
-            elif e_phoff + e_phnum * e_phentsize > self.raw.length:
-                self.log.log_error(
-                    f"program headers exceed file size (offset={e_phoff}, num={e_phnum}, entsize={e_phentsize}, filelen={self.raw.length})."
-                )
-                return False  # cannot read program headers.
-
-            # check program header entry size consistency.
-            if program_headers_exist and e_phentsize != P_HEADER_SIZE:
-                self.log.log_error(
-                    f"unexpected program header entry size: {e_phentsize} (expected {P_HEADER_SIZE}). cannot parse segments."
-                )
-                return False  # fail if entry size is wrong.
-
-            # --- define tag types (keep definitions, they are cheap) ---
-            self.log.log_info("defining psp hardware tag types...")
-            # pre-create tag types using the helper function and the global dictionary.
-            for name, icon in PSP_TAG_TYPES.items():
-                self._get_or_create_tag_type(name, icon)
-
-            # --- add core psp memory segments ---
-            self.log.log_info("mapping core psp hardware memory regions...")
-
-            # helper function to add segment and associated tag/comment.
-            def add_memory_region(
-                addr, size, perms, name, tag_name="Memory Region", tag_icon="🗺️"
-            ):
-                self.log.log_info(
-                    f"  mapping {name}: addr=0x{addr:08x}, size=0x{size:x}"
-                )
-                # add the segment with zero offset/length from the file (it's ram or io).
-                self.add_auto_segment(addr, size, 0, 0, perms)
-                # get the tag type (use proper case name).
-                tag_type = self._get_or_create_tag_type(tag_name, tag_icon)
-                if tag_type:
-                    # add tag at the start of the region.
-                    self.add_tag(addr, tag_type, data=f"{name} Start")
-                # add comment at the start of the region (proper case allowed here).
-                self.set_comment_at(addr, f"{name} ({size // 1024}KB)")
-
-            # sc cpu scratchpad (16kb) - fast internal ram.
-            add_memory_region(0x00010000, 0x4000, self.RWX_FLAGS, "SC CPU Scratchpad")
-
-            # vram / edram (8mb) - video ram. usually rw.
-            add_memory_region(0x04000000, 0x800000, self.RW_FLAGS, "VRAM / EDRAM")
-
-            # main ram (assume 32mb for psp-1000 default).
-            main_ram_base = 0x08000000
-            main_ram_size = 0x02000000  # 32mb default
-            add_memory_region(
-                main_ram_base,
-                main_ram_size,
-                self.RWX_FLAGS,
-                f"Main RAM ({main_ram_size // (1024*1024)}MB)",
-            )
-
-            # i/o ports - map the main known blocks as rw segments. tag as hardware registers.
-            add_memory_region(
-                0x1C000000,
-                0x01000000,
-                self.RW_FLAGS,
-                "I/O Ports Block 1",
-                tag_name="Hardware Register",
-                tag_icon="🔩",
-            )  # 16mb (covers 1cxxxxxx)
-            add_memory_region(
-                0x1D000000,
-                0x02000000,
-                self.RW_FLAGS,
-                "I/O Ports Block 2",
-                tag_name="Hardware Register",
-                tag_icon="🔩",
-            )  # 32mb (covers 1dxxxxxx, 1exxxxxx)
-            add_memory_region(
-                0x1FF00000,
-                0x00000A00,
-                self.RW_FLAGS,
-                "NAND DMA IO Buffers",
-                tag_name="NAND Flash",
-                tag_icon="💾",
-            )  # ~2.5kb
-
-            # shared ram (2mb) - contains exception vectors.
-            add_memory_region(0x1FC00000, 0x200000, self.RWX_FLAGS, "Shared RAM")
-
-            # boot rom (16kb standard mips size) - mapped via kseg1 uncached alias.
-            boot_rom_base = 0xBFC00000  # kseg1 virtual address for physical 0x1fc00000
-            boot_rom_size = 0x4000  # 16kb
-            # map as zero-filled rx segment at the virtual address.
-            add_memory_region(
-                boot_rom_base, boot_rom_size, self.RX_FLAGS, "Boot ROM (Virtual Alias)"
-            )
-            # define common mips boot vectors (relative to boot_rom_base). use proper case for symbol names.
-            self.define_auto_symbol(
-                Symbol(SymbolType.DataSymbol, boot_rom_base + 0x000, "Reset_Vector")
-            )
-            self.define_auto_symbol(
-                Symbol(
-                    SymbolType.DataSymbol,
-                    boot_rom_base + 0x100,
-                    "TLB_Refill_Vector_BEV0",
-                )
-            )  # utlb miss
-            self.define_auto_symbol(
-                Symbol(
-                    SymbolType.DataSymbol,
-                    boot_rom_base + 0x180,
-                    "Cache_Error_Vector_BEV0",
-                )
-            )  # cache error / xtlb miss
-            self.define_auto_symbol(
-                Symbol(
-                    SymbolType.DataSymbol,
-                    boot_rom_base + 0x200,
-                    "General_Exception_Vector_BEV0",
-                )
-            )
-
-            # --- map elf segments ---
-            self.log.log_info(f"mapping elf program segments (if any)...")
-            if program_headers_exist:  # only proceed if headers exist and are valid
-                for i in range(e_phnum):
-                    ph_offset_in_file = e_phoff + i * e_phentsize
-                    # read program header bytes (bounds already checked).
-                    ph_bytes = self.raw.read(ph_offset_in_file, P_HEADER_SIZE)
-                    if len(ph_bytes) < P_HEADER_SIZE:
-                        self.log.log_error(
-                            f"could not read full program header {i} at offset 0x{ph_offset_in_file:x}."
-                        )
-                        continue  # skip this header
-
-                    try:
-                        # unpack program header fields.
-                        (
-                            p_type,
-                            p_offset,
-                            p_vaddr,
-                            p_paddr,
-                            p_filesz,
-                            p_memsz,
-                            p_flags,
-                            p_align,
-                        ) = struct.unpack(P_HEADER_FORMAT, ph_bytes)
-                    except struct.error as unpack_err:
-                        self.log.log_error(
-                            f"failed to unpack program header {i}: {unpack_err}"
-                        )
-                        continue  # skip this header
-
-                    # process only loadable segments (pt_load).
-                    if p_type == PT_LOAD:
-                        # use physical address (p_paddr) for mapping in this hardware view.
-                        map_addr = p_paddr
-                        map_size = (
-                            p_memsz  # map the full memory size specified in header.
-                        )
-                        file_offset = (
-                            p_offset  # offset of segment data within the elf file.
-                        )
-                        file_len = p_filesz  # size of data for this segment within the elf file.
-
-                        # validate segment parameters.
-                        if map_size == 0:
-                            self.log.log_warn(
-                                f"skipping pt_load segment {i} at 0x{map_addr:08x} with zero memory size."
-                            )
-                            continue
-                        if file_len > map_size:
-                            self.log.log_warn(
-                                f"pt_load segment {i} file size (0x{file_len:x}) > memory size (0x{map_size:x}). clamping file length."
-                            )
-                            file_len = map_size  # clamp file length to memory size.
-                        # check if the data range is valid within the raw file.
-                        if file_offset + file_len > self.raw.length:
-                            self.log.log_error(
-                                f"pt_load segment {i} data (offset=0x{file_offset:x}, len=0x{file_len:x}) exceeds file bounds (len={self.raw.length}). skipping segment."
-                            )
-                            continue
-
-                        # --- determine segment permissions from elf flags ---
-                        # start with an integer 0, not SegmentFlag(0)
-                        bn_flags_int = 0
-                        perm_str = ""  # for logging
-                        if p_flags & PF_R:
-                            bn_flags_int |= SegmentFlag.SegmentReadable
-                            perm_str += "r"
-                        else:
-                            perm_str += "-"
-                        if p_flags & PF_W:
-                            bn_flags_int |= SegmentFlag.SegmentWritable
-                            perm_str += "w"
-                        else:
-                            perm_str += "-"
-                        if p_flags & PF_X:
-                            bn_flags_int |= SegmentFlag.SegmentExecutable
-                            perm_str += "x"
-                        else:
-                            perm_str += "-"
-                        # -----------------------------------------------------
-
-                        self.log.log_info(
-                            f"  mapping segment {i}: addr=0x{map_addr:08x}, memsize=0x{map_size:x}, "
-                            f"fileoffset=0x{file_offset:x}, filesize=0x{file_len:x}, flags={perm_str}"
-                        )
-
-                        # add the segment: map 'map_size' bytes starting at 'map_addr',
-                        # taking 'file_len' bytes from the raw file at 'file_offset'.
-                        # binary ninja handles zero-filling the bss portion (map_size > file_len).
-                        # pass the final integer value for flags.
-                        self.add_auto_segment(
-                            map_addr, map_size, file_offset, file_len, bn_flags_int
-                        )
-                        # add comment using proper case
-                        self.set_comment_at(map_addr, f"ELF Segment {i} (LOAD)")
-
-                        # add comment for bss section if it exists.
-                        if map_size > file_len:
-                            bss_start = map_addr + file_len
-                            bss_size = map_size - file_len
-                            # check if bss start is within the mapped segment (sanity check)
-                            if bss_start < map_addr + map_size:
-                                self.set_comment_at(
-                                    bss_start,
-                                    f"ELF Segment {i} BSS Start (Size: 0x{bss_size:x})",
-                                )
-
-                    else:
-                        # log other segment types if needed for debugging.
-                        self.log.log_info(
-                            f"  skipping segment {i}: type=0x{p_type:x} (not pt_load)"
-                        )
-            else:
-                self.log.log_info("no program headers found in elf file to map.")
-
-            # --- map elf sections ---
-            # call the helper function to handle section mapping
-            self._map_elf_sections(e_shoff, e_shnum, e_shentsize, e_shstrndx)
-
-            # --- define entry point symbol ---
-            # use the local_entry_point parsed from the header
-            self.log.log_info(f"adding entry point at 0x{local_entry_point:08x}")
-            # validate entry point address before adding.
-            # check if it falls within a mapped segment (elf segment or hardware region).
-            segment_at_entry = self.get_segment_at(local_entry_point)
-            if segment_at_entry:
-                self.log.log_info(
-                    f"entry point 0x{local_entry_point:08x} is within segment starting at 0x{segment_at_entry.start:08x}."
-                )
-                # check if the segment is executable.
-                if segment_at_entry.executable:
-                    # use the api to add the entry point.
-                    self.add_entry_point(local_entry_point)
-                    # use proper case for standard symbol name
-                    self.define_auto_symbol(
-                        Symbol(SymbolType.FunctionSymbol, local_entry_point, "_start")
-                    )
-                    # attempt to define a function at the entry point for analysis.
-                    try:
-                        self.add_function(local_entry_point)
-                    except Exception as func_err:
-                        # log warning if function definition fails.
-                        self.log.log_warn(
-                            f"could not define function at entry point 0x{local_entry_point:08x}: {func_err}"
-                        )
-                else:
-                    self.log.log_warn(
-                        f"entry point 0x{local_entry_point:08x} is in a non-executable segment. defining data symbol instead."
-                    )
-                    self.define_auto_symbol(
-                        Symbol(
-                            SymbolType.DataSymbol,
-                            local_entry_point,
-                            "_entry_point_data",
-                        )
-                    )
-
-            else:
-                self.log.log_error(
-                    f"entry point 0x{local_entry_point:08x} is not within any mapped segment. cannot set entry point or define symbol."
-                )
-                # consider if this should be a fatal error. for now, just log.
-
-            # --- define i/o registers by iterating through the global list ---
-            self.log.log_info("defining psp i/o registers...")
-            for addr, name, tag_name, desc in PSP_IO_REGISTERS:
-                # get the icon for the tag type, providing a default if needed
-                icon = PSP_TAG_TYPES.get(
-                    tag_name, "🔩"
-                )  # default to generic hardware icon
-                self._define_reg_with_tag(addr, name, tag_name, icon, desc)
+            self._define_tag_types()
+            self._map_memory_regions()
+            self._map_elf_segments()
+            self._map_elf_sections()
+            self._define_io_registers()
+            self._define_entry_point()
 
             # --- final analysis update ---
             self.log.log_info("psp elf loading complete. updating analysis...")
@@ -1195,22 +1228,17 @@ class PSPView(BinaryView):
         """returns the entry point address read from the elf header"""
         # this is called by the core *after* init() completes.
         # the core knows the entry point because we called self.add_entry_point()
-        # if multiple entry points were added, return the first one.
-        # if no entry points were added (e.g., due to error), return 0 or start address.
+        # return the first entry point added, or fallback to header value / start.
         if len(self.entry_points) > 0:
             return self.entry_points[0]
-        # fallback if add_entry_point failed or wasn't called
-        # try reading the parsed value again (if init failed maybe?)
-        try:
-            header_bytes = self.raw.read(0, ELF_HEADER_SIZE)
-            if len(header_bytes) >= ELF_HEADER_SIZE:
-                _, _, _, _, entry, _, _, _, _, _, _, _, _, _ = struct.unpack(
-                    ELF_HEADER_FORMAT, header_bytes
-                )
-                return entry
-        except:
-            pass  # ignore errors here, just trying a fallback
-        return self.start  # default to start address if entry point unknown
+        elif self.elf_header:
+            return self.elf_header.e_entry
+        else:
+            # this case should ideally not happen if init succeeded
+            log_warn(
+                "[PSP] perform_get_entry_point called but no entry points defined and header not parsed. returning start address."
+            )
+            return self.start
 
     def perform_get_address_size(self) -> int:
         """psp uses 32-bit addresses"""
