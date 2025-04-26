@@ -616,7 +616,7 @@ class NDSView(BinaryView):
             "Gamecard": "💾",
             "Interrupts": "⚡",
             "Power": "🔋",
-            "Memory Control": "🧠",
+            "Memory Control": "🐏",
             "Math": "➗",
             "3D Engine": "🧊",
             "Sound": "🔊",
