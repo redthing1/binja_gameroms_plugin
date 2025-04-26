@@ -299,7 +299,7 @@ class GBAView(BinaryView):
                 return False
         except Exception as e:
             # Use a generic logger name here as self.log isn't available in classmethod
-            log_error(f"[GBA Validation] error reading fixed value byte: {e}")
+            log_error(f"[GBA] error reading fixed value byte: {e}")
             return False
 
         # could add header checksum validation here if needed
