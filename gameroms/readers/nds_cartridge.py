@@ -322,6 +322,14 @@ class NDSRomPrinter:
             nds_rom.arm9_overlay_table, nds_rom.arm7_overlay_table
         )
 
+        # validation
+        is_valid = NDSRomReader.is_valid(nds_rom.rom_data)
+        if is_valid:
+            print("\nROM is valid.")
+        else:
+            print("\nROM is invalid.")
+        print("\n" + "=" * 40)
+
     @staticmethod
     def _print_header(header: NDSCartridgeHeader):
         print("NDS ROM Header Information:")
