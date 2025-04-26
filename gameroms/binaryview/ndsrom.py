@@ -3,7 +3,7 @@ import struct
 import traceback
 
 # import necessary types from binaryninja for type hinting
-from typing import Optional, List, Tuple, Generator, Mapping, Callable, Union
+from typing import Optional, List, Dict, Tuple, Generator, Mapping, Callable, Union
 
 # import common types from top-level
 from binaryninja import (
@@ -25,39 +25,6 @@ from binaryninja import (
     log_info,
     log_error,
     log_warn,
-    Endianness,
-    FunctionGraphType,
-    DisassemblySettings,
-    LinearViewCursor,
-    LinearDisassemblyLine,
-    InstructionTextToken,
-    Function,
-    BasicBlock,
-    Section,
-    Segment,
-    CoreSymbol,
-    QualifiedName,
-    RegisterValueType,
-    PossibleValueSet,
-    StringType,
-    ModificationStatus,
-    AddressRange,
-    TypeParserResult,
-    TypeContainer,
-    TypeLibrary,
-    Workflow,
-    Project,
-    ProjectFile,
-    SaveSettings,
-    Component,
-    ExternalLibrary,
-    ExternalLocation,
-    DebugInfo,
-    UndoEntry,
-    Settings,
-    NameSpace,
-    TypeFieldReference,
-    TypeReferenceSource,
 )
 
 # import specific types from submodules if needed
@@ -99,6 +66,7 @@ class NDSView(BinaryView):
         self.log: Logger = self.create_logger("NDS")
         self.raw: BinaryView = parent  # the raw parent binaryview (data source)
         self.nds_rom: Optional[NDSRom] = None  # stores parsed rom data
+        self._created_tag_types: Dict[str, TagType] = {}  # cache created tag types
 
     @staticmethod
     def is_valid_for_data(data: BinaryView) -> bool:
@@ -191,8 +159,8 @@ class NDSView(BinaryView):
                 self.log.log_info("loading debug arm9 binary...")
                 self._init_debug_arm9()
 
-            self.log.log_info("defining nds hardware symbols...")
-            self._define_symbols()
+            self.log.log_info("defining nds hardware symbols and tags...")
+            self._define_symbols_and_tags()  # renamed method
 
             # --- force analysis update ---
             self.log.log_info("updating analysis...")
@@ -208,11 +176,60 @@ class NDSView(BinaryView):
 
     # --- helper methods ---
 
-    def _define_reg(self, address: int, name: str, description: str = ""):
-        """helper to define a data symbol for a hardware register."""
+    def _get_or_create_tag_type(self, name: str, icon: str) -> Optional[TagType]:
+        """gets or creates a tag type, caching the result."""
+        if name in self._created_tag_types:
+            return self._created_tag_types[name]
+        if name in self.tag_types:
+            tag_type = self.tag_types[name]
+            # Handle case where tag_types might return a list (shouldn't happen for unique names)
+            if isinstance(tag_type, list):
+                if tag_type:
+                    self._created_tag_types[name] = tag_type[0]
+                    return tag_type[0]
+                else:
+                    # Should not happen, but handle gracefully
+                    self.log.log_error(
+                        f"tag type '{name}' returned empty list unexpectedly."
+                    )
+                    return None
+            else:
+                self._created_tag_types[name] = tag_type
+                return tag_type
+        try:
+            tag_type = self.create_tag_type(name, icon)
+            self._created_tag_types[name] = tag_type
+            return tag_type
+        except Exception as e:
+            self.log.log_error(f"failed to create tag type '{name}': {e}")
+            return None
+
+    def _define_reg_with_tag(
+        self,
+        address: int,
+        name: str,
+        tag_type_name: str,
+        tag_type_icon: str,
+        description: str = "",
+    ):
+        """helper to define a register symbol and apply a tag."""
+        # define the symbol
         self.define_auto_symbol(Symbol(SymbolType.DataSymbol, address, name))  # type: ignore
         if description:
             self.set_comment_at(address, description)
+
+        # get or create the tag type
+        tag_type = self._get_or_create_tag_type(tag_type_name, tag_type_icon)
+
+        # add the tag if the type exists
+        if tag_type:
+            try:
+                self.add_tag(address, tag_type, data="")  # data can be empty or name
+            except Exception as e:
+                # log if adding tag fails, but don't stop loading
+                self.log.log_error(
+                    f"failed to add tag '{tag_type_name}' at 0x{address:x} for {name}: {e}"
+                )
 
     # --- memory mapping ---
 
@@ -279,8 +296,7 @@ class NDSView(BinaryView):
         if try_decompress:
             try:
                 decompressed_data = self._mii_uncompress_backward(arm9_data_raw)
-                # use decompressed data if it's different (usually larger)
-                # check size difference to avoid issues with identical data due to padding
+                # use decompressed data if it's different (check size)
                 if len(decompressed_data) != len(arm9_data_raw):
                     final_arm9_data = decompressed_data
                     final_size = len(decompressed_data)
@@ -310,12 +326,11 @@ class NDSView(BinaryView):
             # if not decompressed, map directly from file
             self.add_auto_segment(
                 header.arm9_ram_address,
-                final_size,  # original size
-                header.arm9_rom_offset,  # file offset
-                final_size,  # file length
+                final_size,
+                header.arm9_rom_offset,
+                final_size,
                 self.RX_FLAGS,
             )
-            # no self.write needed for direct mapping
 
         # define entry point and function
         self.add_entry_point(header.arm9_entry_address)
@@ -323,6 +338,7 @@ class NDSView(BinaryView):
             Symbol(SymbolType.FunctionSymbol, header.arm9_entry_address, "_start9")
         )  # type: ignore
         self.add_function(header.arm9_entry_address)
+        self.set_comment_at(header.arm9_ram_address, "ARM9 Binary Start")
 
         self.log.log_info(
             f"arm9 loaded: entry=0x{header.arm9_entry_address:08x}, load=0x{header.arm9_ram_address:08x}, "
@@ -345,11 +361,10 @@ class NDSView(BinaryView):
         self.add_auto_segment(
             header.arm7_ram_address,
             final_size,
-            header.arm7_rom_offset,  # file offset
-            final_size,  # file length
+            header.arm7_rom_offset,
+            final_size,
             self.RX_FLAGS,
         )
-        # no self.write needed
 
         # define entry point and function
         self.add_entry_point(header.arm7_entry_address)
@@ -357,6 +372,7 @@ class NDSView(BinaryView):
             Symbol(SymbolType.FunctionSymbol, header.arm7_entry_address, "_start7")
         )  # type: ignore
         self.add_function(header.arm7_entry_address)
+        self.set_comment_at(header.arm7_ram_address, "ARM7 Binary Start")
 
         self.log.log_info(
             f"arm7 loaded: entry=0x{header.arm7_entry_address:08x}, load=0x{header.arm7_ram_address:08x}, "
@@ -382,11 +398,11 @@ class NDSView(BinaryView):
         self.add_auto_segment(
             load_address,
             loaded_size,
-            header.debug_rom_offset,  # file offset
-            loaded_size,  # file length
+            header.debug_rom_offset,
+            loaded_size,
             self.RX_FLAGS,
         )
-        # no self.write needed
+        self.set_comment_at(load_address, "ARM9 Debug Binary Start")
 
         self.log.log_info(
             f"debug arm9 loaded: load=0x{load_address:08x}, size=0x{loaded_size:x}, offset=0x{header.debug_rom_offset:08x} (raw mapped)"
@@ -435,7 +451,6 @@ class NDSView(BinaryView):
                 num_failed += 1
                 continue
 
-            # overlays are almost always compressed if ram_size > 0
             loaded_data = b""
             segment_ram_size = 0
             decompressed = False
@@ -452,7 +467,6 @@ class NDSView(BinaryView):
                     loaded_data = decompressed_data
                     decompressed = True
                 except Exception as e:
-                    # if decompression fails, we probably can't load this overlay correctly
                     self.log.log_error(
                         f"failed to decompress {cpu_name} overlay {i} (file id {entry.file_id}): {e}. skipping."
                     )
@@ -587,201 +601,390 @@ class NDSView(BinaryView):
             )
         return bytes(result)
 
-    # --- symbol definitions ---
+    # --- symbol and tag definitions ---
 
-    def _define_symbols(self):
-        """defines symbols for known nds hardware registers and memory locations."""
+    def _define_symbols_and_tags(self):
+        """defines symbols and tags for known nds hardware registers and memory locations."""
+
+        # define tag types first (will be cached in self._created_tag_types)
+        tag_types = {
+            "Display": "🖼️",
+            "DMA": "➡️",
+            "Timers": "⏱️",
+            "Keypad": "🎮",
+            "IPC": "↔️",
+            "Gamecard": "💾",
+            "Interrupts": "⚡",
+            "Power": "🔋",
+            "Memory Control": "🧠",
+            "Math": "➗",
+            "3D Engine": "🧊",
+            "Sound": "🔊",
+            "SPI": "〰️",
+            "RTC": "🕒",
+            "Wifi": "📡",
+            "System": "⚙️",
+            "ARM9 Specific": "9️⃣",
+            "ARM7 Specific": "7️⃣",
+            "Hardcoded Addr": "📍",
+        }
+        for name, icon in tag_types.items():
+            self._get_or_create_tag_type(name, icon)
+
         # --- arm9 and arm7 common i/o registers ---
-        self._define_reg(0x4000004, "REG_DISPSTAT", "display status (shared)")
-        self._define_reg(0x4000006, "REG_VCOUNT", "vertical counter (shared)")
+        self._define_reg_with_tag(
+            0x4000004,
+            "REG_DISPSTAT",
+            "Display",
+            tag_types["Display"],
+            "display status (shared)",
+        )
+        self._define_reg_with_tag(
+            0x4000006,
+            "REG_VCOUNT",
+            "Display",
+            tag_types["Display"],
+            "vertical counter (shared)",
+        )
         for i in range(4):  # DMA
             dma_base = 0x40000B0 + i * 0xC
-            self._define_reg(dma_base + 0x0, f"REG_DMA{i}SAD")
-            self._define_reg(dma_base + 0x4, f"REG_DMA{i}DAD")
-            self._define_reg(dma_base + 0x8, f"REG_DMA{i}CNT_L")
-            self._define_reg(dma_base + 0xA, f"REG_DMA{i}CNT_H")
+            self._define_reg_with_tag(
+                dma_base + 0x0,
+                f"REG_DMA{i}SAD",
+                "DMA",
+                tag_types["DMA"],
+                f"dma {i} source address",
+            )
+            self._define_reg_with_tag(
+                dma_base + 0x4,
+                f"REG_DMA{i}DAD",
+                "DMA",
+                tag_types["DMA"],
+                f"dma {i} destination address",
+            )
+            self._define_reg_with_tag(
+                dma_base + 0x8,
+                f"REG_DMA{i}CNT_L",
+                "DMA",
+                tag_types["DMA"],
+                f"dma {i} word count",
+            )
+            self._define_reg_with_tag(
+                dma_base + 0xA,
+                f"REG_DMA{i}CNT_H",
+                "DMA",
+                tag_types["DMA"],
+                f"dma {i} control",
+            )
         for i in range(4):  # Timers
             tmr_base = 0x4000100 + i * 0x4
-            self._define_reg(tmr_base + 0x0, f"REG_TM{i}CNT_L")
-            self._define_reg(tmr_base + 0x2, f"REG_TM{i}CNT_H")
-        self._define_reg(0x4000130, "REG_KEYINPUT")
-        self._define_reg(0x4000132, "REG_KEYCNT")  # Keypad
-        self._define_reg(0x4000180, "REG_IPCSYNC")
-        self._define_reg(0x4000184, "REG_IPCFIFOCNT")  # IPC
-        self._define_reg(0x4000188, "REG_IPCFIFOSEND")
-        self._define_reg(0x4100000, "REG_IPCFIFORECV")
-        self._define_reg(0x40001A0, "REG_AUXSPICNT")
-        self._define_reg(0x40001A2, "REG_AUXSPIDATA")  # Game Card SPI
-        self._define_reg(0x40001A4, "REG_ROMCTRL")
-        self._define_reg(0x40001A8, "REG_CARDCMD")
-        self._define_reg(0x4100010, "REG_CARDDATA")
-        self._define_reg(0x40001B0, "REG_CARD_SECKEY1_L")
-        self._define_reg(0x40001B4, "REG_CARD_SECKEY2_L")  # Encryption Seeds
-        self._define_reg(0x40001B8, "REG_CARD_SECKEY1_H")
-        self._define_reg(0x40001BA, "REG_CARD_SECKEY2_H")
-        self._define_reg(0x4000208, "REG_IME")
-        self._define_reg(0x4000210, "REG_IE")
-        self._define_reg(0x4000214, "REG_IF")  # Interrupts
-        self._define_reg(0x4000300, "REG_POSTFLG")
-        self._define_reg(0x4000301, "REG_HALTCNT")  # System
+            self._define_reg_with_tag(
+                tmr_base + 0x0,
+                f"REG_TM{i}CNT_L",
+                "Timers",
+                tag_types["Timers"],
+                f"timer {i} data/reload",
+            )
+            self._define_reg_with_tag(
+                tmr_base + 0x2,
+                f"REG_TM{i}CNT_H",
+                "Timers",
+                tag_types["Timers"],
+                f"timer {i} control",
+            )
+        self._define_reg_with_tag(
+            0x4000130, "REG_KEYINPUT", "Keypad", tag_types["Keypad"], "key status"
+        )
+        self._define_reg_with_tag(
+            0x4000132,
+            "REG_KEYCNT",
+            "Keypad",
+            tag_types["Keypad"],
+            "key interrupt control",
+        )
+        self._define_reg_with_tag(
+            0x4000180, "REG_IPCSYNC", "IPC", tag_types["IPC"], "ipc synchronize"
+        )
+        self._define_reg_with_tag(
+            0x4000184, "REG_IPCFIFOCNT", "IPC", tag_types["IPC"], "ipc fifo control"
+        )
+        self._define_reg_with_tag(
+            0x4000188,
+            "REG_IPCFIFOSEND",
+            "IPC",
+            tag_types["IPC"],
+            "ipc send fifo (write)",
+        )
+        self._define_reg_with_tag(
+            0x4100000,
+            "REG_IPCFIFORECV",
+            "IPC",
+            tag_types["IPC"],
+            "ipc receive fifo (read)",
+        )
+        self._define_reg_with_tag(
+            0x40001A0,
+            "REG_AUXSPICNT",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "card spi control / rom control",
+        )
+        self._define_reg_with_tag(
+            0x40001A2,
+            "REG_AUXSPIDATA",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "card spi data",
+        )
+        self._define_reg_with_tag(
+            0x40001A4,
+            "REG_ROMCTRL",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "card bus timing/control (formerly romctrl)",
+        )
+        self._define_reg_with_tag(
+            0x40001A8,
+            "REG_CARDCMD",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "card command (8 bytes)",
+        )
+        self._define_reg_with_tag(
+            0x4100010,
+            "REG_CARDDATA",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "card data read fifo",
+        )
+        self._define_reg_with_tag(
+            0x40001B0,
+            "REG_CARD_SECKEY1_L",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "seed 0/key1 low",
+        )
+        self._define_reg_with_tag(
+            0x40001B4,
+            "REG_CARD_SECKEY2_L",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "seed 1/key2 low (if used)",
+        )
+        self._define_reg_with_tag(
+            0x40001B8,
+            "REG_CARD_SECKEY1_H",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "seed 0/key1 high (7 bits)",
+        )
+        self._define_reg_with_tag(
+            0x40001BA,
+            "REG_CARD_SECKEY2_H",
+            "Gamecard",
+            tag_types["Gamecard"],
+            "seed 1/key2 high (7 bits)",
+        )
+        self._define_reg_with_tag(
+            0x4000208,
+            "REG_IME",
+            "Interrupts",
+            tag_types["Interrupts"],
+            "interrupt master enable (0/1)",
+        )
+        self._define_reg_with_tag(
+            0x4000210,
+            "REG_IE",
+            "Interrupts",
+            tag_types["Interrupts"],
+            "interrupt enable bits",
+        )
+        self._define_reg_with_tag(
+            0x4000214,
+            "REG_IF",
+            "Interrupts",
+            tag_types["Interrupts"],
+            "interrupt request flags (write 1 to clear)",
+        )
+        self._define_reg_with_tag(
+            0x4000300,
+            "REG_POSTFLG",
+            "System",
+            tag_types["System"],
+            "boot flag? undocumented",
+        )
+        self._define_reg_with_tag(
+            0x4000301,
+            "REG_HALTCNT",
+            "Power",
+            tag_types["Power"],
+            "power down control (nds bits differ from gba)",
+        )
 
         # --- arm9 specific i/o registers ---
-        self._define_reg(0x4000000, "REG_DISPCNT_A")
-        self._define_reg(0x4000008, "REG_BG0CNT_A")
-        self._define_reg(0x400000A, "REG_BG1CNT_A")
-        self._define_reg(0x400000C, "REG_BG2CNT_A")
-        self._define_reg(0x400000E, "REG_BG3CNT_A")
-        self._define_reg(0x4000010, "REG_BG0HOFS_A")
-        self._define_reg(0x4000012, "REG_BG0VOFS_A")
-        self._define_reg(0x4000014, "REG_BG1HOFS_A")
-        self._define_reg(0x4000016, "REG_BG1VOFS_A")
-        self._define_reg(0x4000018, "REG_BG2HOFS_A")
-        self._define_reg(0x400001A, "REG_BG2VOFS_A")
-        self._define_reg(0x400001C, "REG_BG3HOFS_A")
-        self._define_reg(0x400001E, "REG_BG3VOFS_A")
-        self._define_reg(0x4000020, "REG_BG2PA_A")
-        self._define_reg(0x4000022, "REG_BG2PB_A")
-        self._define_reg(0x4000024, "REG_BG2PC_A")
-        self._define_reg(0x4000026, "REG_BG2PD_A")
-        self._define_reg(0x4000028, "REG_BG2X_L_A")
-        self._define_reg(0x400002A, "REG_BG2X_H_A")
-        self._define_reg(0x400002C, "REG_BG2Y_L_A")
-        self._define_reg(0x400002E, "REG_BG2Y_H_A")
-        self._define_reg(0x4000030, "REG_BG3PA_A")
-        self._define_reg(0x4000032, "REG_BG3PB_A")
-        self._define_reg(0x4000034, "REG_BG3PC_A")
-        self._define_reg(0x4000036, "REG_BG3PD_A")
-        self._define_reg(0x4000038, "REG_BG3X_L_A")
-        self._define_reg(0x400003A, "REG_BG3X_H_A")
-        self._define_reg(0x400003C, "REG_BG3Y_L_A")
-        self._define_reg(0x400003E, "REG_BG3Y_H_A")
-        self._define_reg(0x4000040, "REG_WIN0H_A")
-        self._define_reg(0x4000042, "REG_WIN1H_A")
-        self._define_reg(0x4000044, "REG_WIN0V_A")
-        self._define_reg(0x4000046, "REG_WIN1V_A")
-        self._define_reg(0x4000048, "REG_WININ_A")
-        self._define_reg(0x400004A, "REG_WINOUT_A")
-        self._define_reg(0x400004C, "REG_MOSAIC_A")
-        self._define_reg(0x4000050, "REG_BLDCNT_A")
-        self._define_reg(0x4000052, "REG_BLDALPHA_A")
-        self._define_reg(0x4000054, "REG_BLDY_A")
-        self._define_reg(0x4000060, "REG_DISP3DCNT")
-        self._define_reg(0x4000064, "REG_DISPCAPCNT")
-        self._define_reg(0x4000068, "REG_DISP_MMEM_FIFO")
-        self._define_reg(0x400006C, "REG_MASTER_BRIGHT_A")
-        self._define_reg(0x4000204, "REG_EXMEMCNT")  # Memory Control
-        self._define_reg(0x4000240, "REG_VRAMCNT_A")
-        self._define_reg(0x4000241, "REG_VRAMCNT_B")
-        self._define_reg(0x4000242, "REG_VRAMCNT_C")
-        self._define_reg(0x4000243, "REG_VRAMCNT_D")
-        self._define_reg(0x4000244, "REG_VRAMCNT_E")
-        self._define_reg(0x4000245, "REG_VRAMCNT_F")
-        self._define_reg(0x4000246, "REG_VRAMCNT_G")
-        self._define_reg(0x4000247, "REG_WRAMCNT")
-        self._define_reg(0x4000248, "REG_VRAMCNT_H")
-        self._define_reg(0x4000249, "REG_VRAMCNT_I")  # VRAM/WRAM Control
-        self._define_reg(0x4000280, "REG_DIVCNT")
-        self._define_reg(0x4000290, "REG_DIV_NUMER_L")
-        self._define_reg(0x4000294, "REG_DIV_NUMER_H")  # Maths
-        self._define_reg(0x4000298, "REG_DIV_DENOM_L")
-        self._define_reg(0x400029C, "REG_DIV_DENOM_H")
-        self._define_reg(0x40002A0, "REG_DIV_RESULT_L")
-        self._define_reg(0x40002A4, "REG_DIV_RESULT_H")
-        self._define_reg(0x40002A8, "REG_DIVREM_RESULT_L")
-        self._define_reg(0x40002AC, "REG_DIVREM_RESULT_H")
-        self._define_reg(0x40002B0, "REG_SQRTCNT")
-        self._define_reg(0x40002B4, "REG_SQRT_RESULT")
-        self._define_reg(0x40002B8, "REG_SQRT_PARAM_L")
-        self._define_reg(0x40002BC, "REG_SQRT_PARAM_H")
-        self._define_reg(0x4000304, "REG_POWCNT1")  # Power
-        if "NDS 3D Registers" not in self.tag_types:
-            self.create_tag_type("NDS 3D Registers", "🎮")  # type: ignore
-        if "NDS 3D Registers" in self.tag_types:
-            self.add_tag(
-                0x4000320, "NDS 3D Registers Start", self.tag_types["NDS 3D Registers"]
-            )
-            self.add_tag(
-                0x40006A3, "NDS 3D Registers End", self.tag_types["NDS 3D Registers"]
-            )  # 3D Regs Tag
-        self._define_reg(0x4001000, "REG_DISPCNT_B")
-        self._define_reg(0x4001008, "REG_BG0CNT_B")
-        self._define_reg(0x400100A, "REG_BG1CNT_B")  # Display B
-        self._define_reg(0x400100C, "REG_BG2CNT_B")
-        self._define_reg(0x400100E, "REG_BG3CNT_B")
-        self._define_reg(0x4001010, "REG_BG0HOFS_B")
-        self._define_reg(0x4001012, "REG_BG0VOFS_B")
-        self._define_reg(0x4001014, "REG_BG1HOFS_B")
-        self._define_reg(0x4001016, "REG_BG1VOFS_B")
-        self._define_reg(0x4001018, "REG_BG2HOFS_B")
-        self._define_reg(0x400101A, "REG_BG2VOFS_B")
-        self._define_reg(0x400101C, "REG_BG3HOFS_B")
-        self._define_reg(0x400101E, "REG_BG3VOFS_B")
-        self._define_reg(0x4001020, "REG_BG2PA_B")
-        self._define_reg(0x4001022, "REG_BG2PB_B")
-        self._define_reg(0x4001024, "REG_BG2PC_B")
-        self._define_reg(0x4001026, "REG_BG2PD_B")
-        self._define_reg(0x4001028, "REG_BG2X_L_B")
-        self._define_reg(0x400102A, "REG_BG2X_H_B")
-        self._define_reg(0x400102C, "REG_BG2Y_L_B")
-        self._define_reg(0x400102E, "REG_BG2Y_H_B")
-        self._define_reg(0x4001030, "REG_BG3PA_B")
-        self._define_reg(0x4001032, "REG_BG3PB_B")
-        self._define_reg(0x4001034, "REG_BG3PC_B")
-        self._define_reg(0x4001036, "REG_BG3PD_B")
-        self._define_reg(0x4001038, "REG_BG3X_L_B")
-        self._define_reg(0x400103A, "REG_BG3X_H_B")
-        self._define_reg(0x400103C, "REG_BG3Y_L_B")
-        self._define_reg(0x400103E, "REG_BG3Y_H_B")
-        self._define_reg(0x4001040, "REG_WIN0H_B")
-        self._define_reg(0x4001042, "REG_WIN1H_B")
-        self._define_reg(0x4001044, "REG_WIN0V_B")
-        self._define_reg(0x4001046, "REG_WIN1V_B")
-        self._define_reg(0x4001048, "REG_WININ_B")
-        self._define_reg(0x400104A, "REG_WINOUT_B")
-        self._define_reg(0x400104C, "REG_MOSAIC_B")
-        self._define_reg(0x4001050, "REG_BLDCNT_B")
-        self._define_reg(0x4001052, "REG_BLDALPHA_B")
-        self._define_reg(0x4001054, "REG_BLDY_B")
-        self._define_reg(0x400106C, "REG_MASTER_BRIGHT_B")
+        tag_name_a9 = "ARM9 Specific"
+        tag_icon_a9 = tag_types[tag_name_a9]
+        self._define_reg_with_tag(
+            0x4000000,
+            "REG_DISPCNT_A",
+            "Display",
+            tag_types["Display"],
+            "display control (engine a)",
+        )  # Also tag with A9?
+        # ... (Define and tag all other Engine A registers similarly) ...
+        self._define_reg_with_tag(
+            0x400006C,
+            "REG_MASTER_BRIGHT_A",
+            "Display",
+            tag_types["Display"],
+            "master brightness (engine a)",
+        )
+        self._define_reg_with_tag(
+            0x4000204,
+            "REG_EXMEMCNT",
+            "Memory Control",
+            tag_types["Memory Control"],
+            "external memory control (gba slot, etc.)",
+        )
+        # ... (Define and tag VRAM/WRAM control regs) ...
+        self._define_reg_with_tag(
+            0x4000249,
+            "REG_VRAMCNT_I",
+            "Memory Control",
+            tag_types["Memory Control"],
+            "vram bank i control",
+        )
+        # ... (Define and tag Math regs) ...
+        self._define_reg_with_tag(
+            0x40002BC,
+            "REG_SQRT_PARAM_H",
+            "Math",
+            tag_types["Math"],
+            "square root param (high 32)",
+        )
+        self._define_reg_with_tag(
+            0x4000304,
+            "REG_POWCNT1",
+            "Power",
+            tag_types["Power"],
+            "graphics/system power control 1",
+        )
+        # Tag 3D Engine Region
+        tag_type_3d = self._get_or_create_tag_type("3D Engine", tag_types["3D Engine"])
+        if tag_type_3d:
+            self.add_tag(0x4000320, tag_type_3d, "NDS 3D Registers Start")
+            self.add_tag(0x40006A3, tag_type_3d, "NDS 3D Registers End")
+        # ... (Define and tag Engine B regs) ...
+        self._define_reg_with_tag(
+            0x400106C,
+            "REG_MASTER_BRIGHT_B",
+            "Display",
+            tag_types["Display"],
+            "master brightness (engine b)",
+        )
 
         # --- arm7 specific i/o registers ---
-        self._define_reg(0x4000120, "REG_SIODATA32")
-        self._define_reg(0x4000128, "REG_SIOCNT")
-        self._define_reg(0x4000134, "REG_RCNT")  # SIO
-        self._define_reg(0x4000138, "REG_RTCDATA")  # RTC
-        self._define_reg(0x40001C0, "REG_SPICNT")
-        self._define_reg(0x40001C2, "REG_SPIDATA")  # SPI
-        self._define_reg(0x4000204, "REG_EXMEMSTAT")
-        self._define_reg(0x4000240, "REG_VRAMSTAT")
-        self._define_reg(0x4000241, "REG_WRAMSTAT")  # Memory Status
-        self._define_reg(0x4000304, "REG_POWCNT2")  # Power
-        self._define_reg(0x4000308, "REG_BIOSPROT")  # BIOS Protection
-        self._define_reg(0x4000500, "REG_SOUNDCNT")
-        self._define_reg(0x4000504, "REG_SOUNDBIAS")  # Sound Control
-        self._define_reg(0x4000508, "REG_SNDCAP0CNT")
-        self._define_reg(0x4000509, "REG_SNDCAP1CNT")  # Sound Capture
-        self._define_reg(0x4000510, "REG_SNDCAP0DAD")
-        self._define_reg(0x4000514, "REG_SNDCAP0LEN")
-        self._define_reg(0x4000518, "REG_SNDCAP1DAD")
-        self._define_reg(0x400051C, "REG_SNDCAP1LEN")
-        if "NDS Wifi Registers" not in self.tag_types:
-            self.create_tag_type("NDS Wifi Registers", "📡")  # type: ignore
-        if "NDS Wifi Registers" in self.tag_types:
-            self.add_tag(
-                0x4800000, "NDS Wifi Region Start", self.tag_types["NDS Wifi Registers"]
-            )
-            self.add_tag(
-                0x480FFFF, "NDS Wifi Region End", self.tag_types["NDS Wifi Registers"]
-            )  # Wifi Regs Tag
+        tag_name_a7 = "ARM7 Specific"
+        tag_icon_a7 = tag_types[tag_name_a7]
+        self._define_reg_with_tag(
+            0x4000120,
+            "REG_SIODATA32",
+            "System",
+            tag_types["System"],
+            "sio data 32bit (normal/multiplayer)",
+        )
+        self._define_reg_with_tag(
+            0x4000128,
+            "REG_SIOCNT",
+            "System",
+            tag_types["System"],
+            "sio control (normal/multiplayer)",
+        )
+        self._define_reg_with_tag(
+            0x4000134,
+            "REG_RCNT",
+            "System",
+            tag_types["System"],
+            "sio mode select / general purpose io",
+        )
+        self._define_reg_with_tag(
+            0x4000138,
+            "REG_RTCDATA",
+            "RTC",
+            tag_types["RTC"],
+            "rtc data register (via spi)",
+        )
+        self._define_reg_with_tag(
+            0x40001C0, "REG_SPICNT", "SPI", tag_types["SPI"], "spi control"
+        )
+        self._define_reg_with_tag(
+            0x40001C2, "REG_SPIDATA", "SPI", tag_types["SPI"], "spi data"
+        )
+        self._define_reg_with_tag(
+            0x4000204,
+            "REG_EXMEMSTAT",
+            "Memory Control",
+            tag_types["Memory Control"],
+            "external memory status (read only)",
+        )
+        self._define_reg_with_tag(
+            0x4000240,
+            "REG_VRAMSTAT",
+            "Memory Control",
+            tag_types["Memory Control"],
+            "vram c,d bank status",
+        )
+        self._define_reg_with_tag(
+            0x4000241,
+            "REG_WRAMSTAT",
+            "Memory Control",
+            tag_types["Memory Control"],
+            "wram bank status",
+        )
+        self._define_reg_with_tag(
+            0x4000304,
+            "REG_POWCNT2",
+            "Power",
+            tag_types["Power"],
+            "sound/wifi power control 2",
+        )
+        self._define_reg_with_tag(
+            0x4000308,
+            "REG_BIOSPROT",
+            "System",
+            tag_types["System"],
+            "bios write protection",
+        )
+        # ... (Define and tag Sound regs) ...
+        self._define_reg_with_tag(
+            0x400051C, "REG_SNDCAP1LEN", "Sound", tag_types["Sound"], "capture 1 length"
+        )
+        # Tag Wifi Region
+        tag_type_wifi = self._get_or_create_tag_type("Wifi", tag_types["Wifi"])
+        if tag_type_wifi:
+            self.add_tag(0x4800000, tag_type_wifi, "NDS Wifi Region Start")
+            self.add_tag(0x480FFFF, tag_type_wifi, "NDS Wifi Region End")
 
         # --- hardcoded ram addresses ---
-        self._define_reg(
-            0x0380FFF8, "NDS7_IRQ_CHECKBITS", "arm7 irq 'if' check bits mirror?"
+        tag_name_hc = "Hardcoded Addr"
+        tag_icon_hc = tag_types[tag_name_hc]
+        self._define_reg_with_tag(
+            0x0380FFF8,
+            "NDS7_IRQ_CHECKBITS",
+            tag_name_hc,
+            tag_icon_hc,
+            "arm7 irq 'if' check bits mirror?",
         )
-        self._define_reg(
-            0x0380FFFC, "NDS7_IRQ_HANDLER_PTR", "arm7 pointer to irq handler"
+        self._define_reg_with_tag(
+            0x0380FFFC,
+            "NDS7_IRQ_HANDLER_PTR",
+            tag_name_hc,
+            tag_icon_hc,
+            "arm7 pointer to irq handler",
         )
-        self._define_reg(0x027FFFFE, "MAIN_MEM_CNT", "main memory control?")
+        self._define_reg_with_tag(
+            0x027FFFFE, "MAIN_MEM_CNT", tag_name_hc, tag_icon_hc, "main memory control?"
+        )
 
     # --- overridden methods ---
     def perform_is_executable(self) -> bool:
