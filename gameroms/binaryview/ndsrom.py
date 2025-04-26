@@ -1,57 +1,327 @@
-import io
 import struct
 import traceback
+from typing import Optional, List, Dict, Tuple
 
-# import necessary types from binaryninja for type hinting
-from typing import Optional, List, Dict, Tuple, Generator, Mapping, Callable, Union
-
-# import common types from top-level
 from binaryninja import (
     BinaryView,
-    BinaryReader,
-    BinaryWriter,
     SegmentFlag,
     SymbolType,
     Symbol,
-    DataVariable,
-    StringReference,
-    ReferenceSource,
     TagType,
     Tag,
-    Type,
     Platform,
     Architecture,
-    FileMetadata,
-    log_info,
+    SectionSemantics,
     log_error,
     log_warn,
+    log_info,
+)
+from binaryninja.log import Logger
+
+from ..readers.nds_cartridge import (
+    NDSRomReader,
+    NDSRom,
+    NDSCartridgeHeader,
+    NDSOverlayTable,
+    NDSFatEntry,
 )
 
-# import specific types from submodules if needed
-# from binaryninja.binaryview import Relocation, RelocationInfo # Removed this line
-from binaryninja.log import Logger  # explicit logger import
-from uuid import UUID
-from os import PathLike  # for type hinting file paths
+# --- nds hardware definitions ---
 
-# assuming nds_cartridge.py is in a sibling 'readers' directory
-# adjust the import path if your structure is different
-try:
-    # relative import for plugin structure
-    from ..readers.nds_cartridge import (
-        NDSRomReader,
-        NDSRom,
-        NDSOverlayTable,
-    )  # make types explicit
-except ImportError:
-    # fallback if running the script directly or structure differs
-    from nds_cartridge import NDSRomReader, NDSRom, NDSOverlayTable
+# dictionary mapping tag type names (proper case) to icons
+NDS_TAG_TYPES: Dict[str, str] = {
+    "Display": "🖼️",
+    "DMA": "➡️",
+    "Timers": "⏱️",
+    "Keypad": "🎮",
+    "IPC": "↔️",
+    "Gamecard": "💾",
+    "Interrupts": "⚡",
+    "Power": "🔋",
+    "Memory Control": "🐏",
+    "Math": "➗",
+    "3D Engine": "🧊",
+    "Sound": "🔊",
+    "SPI": "〰️",
+    "RTC": "🕒",
+    "Wifi": "📡",
+    "System": "⚙️",
+    "ARM9 Specific": "9️⃣",
+    "ARM7 Specific": "7️⃣",
+    "Hardcoded Addr": "📍",
+    "Memory Region": "🗺️",
+    "Hardware Register": "🔩",  # Generic fallback
+}
+
+# list of known i/o registers: (address, name, tag_type_name, description)
+# names and descriptions use proper case for symbols/comments. tag_type_name matches NDS_TAG_TYPES keys.
+NDS_IO_REGISTERS: List[Tuple[int, str, str, str]] = [
+    # --- arm9 and arm7 common i/o registers ---
+    (0x4000004, "REG_DISPSTAT", "Display", "Display Status (Shared)"),
+    (0x4000006, "REG_VCOUNT", "Display", "Vertical Counter (Shared)"),
+    # DMA (Common Part)
+    (0x40000B0, "REG_DMA0SAD", "DMA", "DMA 0 Source Address"),
+    (0x40000B4, "REG_DMA0DAD", "DMA", "DMA 0 Destination Address"),
+    (0x40000B8, "REG_DMA0CNT_L", "DMA", "DMA 0 Word Count"),
+    (0x40000BA, "REG_DMA0CNT_H", "DMA", "DMA 0 Control"),
+    (0x40000BC, "REG_DMA1SAD", "DMA", "DMA 1 Source Address"),
+    (0x40000C0, "REG_DMA1DAD", "DMA", "DMA 1 Destination Address"),
+    (0x40000C4, "REG_DMA1CNT_L", "DMA", "DMA 1 Word Count"),
+    (0x40000C6, "REG_DMA1CNT_H", "DMA", "DMA 1 Control"),
+    (0x40000C8, "REG_DMA2SAD", "DMA", "DMA 2 Source Address"),
+    (0x40000CC, "REG_DMA2DAD", "DMA", "DMA 2 Destination Address"),
+    (0x40000D0, "REG_DMA2CNT_L", "DMA", "DMA 2 Word Count"),
+    (0x40000D2, "REG_DMA2CNT_H", "DMA", "DMA 2 Control"),
+    (0x40000D4, "REG_DMA3SAD", "DMA", "DMA 3 Source Address"),
+    (0x40000D8, "REG_DMA3DAD", "DMA", "DMA 3 Destination Address"),
+    (0x40000DC, "REG_DMA3CNT_L", "DMA", "DMA 3 Word Count"),
+    (0x40000DE, "REG_DMA3CNT_H", "DMA", "DMA 3 Control"),
+    # DMA Fill (ARM9 only?) - Tagging anyway
+    (0x40000E0, "REG_DMA0FILL", "DMA", "DMA 0 Fill Data"),
+    (0x40000E4, "REG_DMA1FILL", "DMA", "DMA 1 Fill Data"),
+    (0x40000E8, "REG_DMA2FILL", "DMA", "DMA 2 Fill Data"),
+    (0x40000EC, "REG_DMA3FILL", "DMA", "DMA 3 Fill Data"),
+    # Timers (Common)
+    (0x4000100, "REG_TM0CNT_L", "Timers", "Timer 0 Data/Reload"),
+    (0x4000102, "REG_TM0CNT_H", "Timers", "Timer 0 Control"),
+    (0x4000104, "REG_TM1CNT_L", "Timers", "Timer 1 Data/Reload"),
+    (0x4000106, "REG_TM1CNT_H", "Timers", "Timer 1 Control"),
+    (0x4000108, "REG_TM2CNT_L", "Timers", "Timer 2 Data/Reload"),
+    (0x400010A, "REG_TM2CNT_H", "Timers", "Timer 2 Control"),
+    (0x400010C, "REG_TM3CNT_L", "Timers", "Timer 3 Data/Reload"),
+    (0x400010E, "REG_TM3CNT_H", "Timers", "Timer 3 Control"),
+    # Keypad (Common)
+    (0x4000130, "REG_KEYINPUT", "Keypad", "Key Status"),
+    (0x4000132, "REG_KEYCNT", "Keypad", "Key Interrupt Control"),
+    # IPC (Common)
+    (0x4000180, "REG_IPCSYNC", "IPC", "IPC Synchronize Register"),
+    (0x4000184, "REG_IPCFIFOCNT", "IPC", "IPC FIFO Control Register"),
+    (0x4000188, "REG_IPCFIFOSEND", "IPC", "IPC Send FIFO (Write)"),
+    (
+        0x4100000,
+        "REG_IPCFIFORECV",
+        "IPC",
+        "IPC Receive FIFO (Read)",
+    ),  # Note different base
+    # Gamecard (Common)
+    (0x40001A0, "REG_AUXSPICNT", "Gamecard", "Card SPI Control / ROM Control"),
+    (0x40001A2, "REG_AUXSPIDATA", "Gamecard", "Card SPI Data/Strobe"),
+    (0x40001A4, "REG_ROMCTRL", "Gamecard", "Card Bus Timing/Control"),
+    (0x40001A8, "REG_CARDCMD", "Gamecard", "Card Command (8 bytes)"),
+    (
+        0x4100010,
+        "REG_CARDDATA",
+        "Gamecard",
+        "Card Data Read FIFO",
+    ),  # Note different base
+    (0x40001B0, "REG_CARD_SECKEY1_L", "Gamecard", "Seed 0/Key1 Low"),
+    (0x40001B4, "REG_CARD_SECKEY2_L", "Gamecard", "Seed 1/Key2 Low (if used)"),
+    (0x40001B8, "REG_CARD_SECKEY1_H", "Gamecard", "Seed 0/Key1 High (7 bits)"),
+    (0x40001BA, "REG_CARD_SECKEY2_H", "Gamecard", "Seed 1/Key2 High (7 bits)"),
+    # Interrupts (Common Part)
+    (0x4000208, "REG_IME", "Interrupts", "Interrupt Master Enable (0/1)"),
+    (0x4000210, "REG_IE", "Interrupts", "Interrupt Enable Bits"),
+    (0x4000214, "REG_IF", "Interrupts", "Interrupt Request Flags (Write 1 to clear)"),
+    # System (Common Part)
+    (0x4000300, "REG_POSTFLG", "System", "Boot Flag? Undocumented"),
+    (
+        0x4000301,
+        "REG_HALTCNT",
+        "Power",
+        "Power Down Control (NDS bits differ from GBA)",
+    ),
+    # --- arm9 specific i/o registers ---
+    (0x4000000, "REG_DISPCNT_A", "Display", "Display Control (Engine A)"),
+    (0x4000008, "REG_BG0CNT_A", "Display", "BG0 Control (Engine A)"),
+    (0x400000A, "REG_BG1CNT_A", "Display", "BG1 Control (Engine A)"),
+    (0x400000C, "REG_BG2CNT_A", "Display", "BG2 Control (Engine A)"),
+    (0x400000E, "REG_BG3CNT_A", "Display", "BG3 Control (Engine A)"),
+    (0x4000010, "REG_BG0HOFS_A", "Display", "BG0 X-Offset (Engine A)"),
+    (0x4000012, "REG_BG0VOFS_A", "Display", "BG0 Y-Offset (Engine A)"),
+    (0x4000014, "REG_BG1HOFS_A", "Display", "BG1 X-Offset (Engine A)"),
+    (0x4000016, "REG_BG1VOFS_A", "Display", "BG1 Y-Offset (Engine A)"),
+    (0x4000018, "REG_BG2HOFS_A", "Display", "BG2 X-Offset (Engine A)"),
+    (0x400001A, "REG_BG2VOFS_A", "Display", "BG2 Y-Offset (Engine A)"),
+    (0x400001C, "REG_BG3HOFS_A", "Display", "BG3 X-Offset (Engine A)"),
+    (0x400001E, "REG_BG3VOFS_A", "Display", "BG3 Y-Offset (Engine A)"),
+    (0x4000020, "REG_BG2PA_A", "Display", "BG2 Rot/Scale Param A (dx) (Engine A)"),
+    (0x4000022, "REG_BG2PB_A", "Display", "BG2 Rot/Scale Param B (dmx) (Engine A)"),
+    (0x4000024, "REG_BG2PC_A", "Display", "BG2 Rot/Scale Param C (dy) (Engine A)"),
+    (0x4000026, "REG_BG2PD_A", "Display", "BG2 Rot/Scale Param D (dmy) (Engine A)"),
+    (0x4000028, "REG_BG2X_A", "Display", "BG2 Reference Point X (Engine A)"),
+    (0x400002C, "REG_BG2Y_A", "Display", "BG2 Reference Point Y (Engine A)"),
+    (0x4000030, "REG_BG3PA_A", "Display", "BG3 Rot/Scale Param A (dx) (Engine A)"),
+    (0x4000032, "REG_BG3PB_A", "Display", "BG3 Rot/Scale Param B (dmx) (Engine A)"),
+    (0x4000034, "REG_BG3PC_A", "Display", "BG3 Rot/Scale Param C (dy) (Engine A)"),
+    (0x4000036, "REG_BG3PD_A", "Display", "BG3 Rot/Scale Param D (dmy) (Engine A)"),
+    (0x4000038, "REG_BG3X_A", "Display", "BG3 Reference Point X (Engine A)"),
+    (0x400003C, "REG_BG3Y_A", "Display", "BG3 Reference Point Y (Engine A)"),
+    (0x4000040, "REG_WIN0H_A", "Display", "Window 0 Horizontal Dimensions (Engine A)"),
+    (0x4000042, "REG_WIN1H_A", "Display", "Window 1 Horizontal Dimensions (Engine A)"),
+    (0x4000044, "REG_WIN0V_A", "Display", "Window 0 Vertical Dimensions (Engine A)"),
+    (0x4000046, "REG_WIN1V_A", "Display", "Window 1 Vertical Dimensions (Engine A)"),
+    (0x4000048, "REG_WININ_A", "Display", "Inside Window 0/1 Control (Engine A)"),
+    (
+        0x400004A,
+        "REG_WINOUT_A",
+        "Display",
+        "Inside OBJ/Outside Window Control (Engine A)",
+    ),
+    (0x400004C, "REG_MOSAIC_A", "Display", "Mosaic Size (Engine A)"),
+    (0x4000050, "REG_BLDCNT_A", "Display", "Color Special Effects Control (Engine A)"),
+    (0x4000052, "REG_BLDALPHA_A", "Display", "Alpha Blending Coefficients (Engine A)"),
+    (0x4000054, "REG_BLDY_A", "Display", "Brightness Coefficient (Engine A)"),
+    (0x4000060, "REG_DISP3DCNT", "3D Engine", "3D Display Control"),
+    (0x4000064, "REG_DISPCAPCNT", "Display", "Display Capture Control"),
+    (0x4000068, "REG_DISP_MMEM_FIFO", "Display", "Main Memory Display FIFO"),
+    (0x400006C, "REG_MASTER_BRIGHT_A", "Display", "Master Brightness (Engine A)"),
+    (
+        0x4000204,
+        "REG_EXMEMCNT",
+        "Memory Control",
+        "External Memory Control (GBA Slot, etc.)",
+    ),
+    (0x4000240, "REG_VRAMCNT_A", "Memory Control", "VRAM-A Bank Control"),
+    (0x4000241, "REG_VRAMCNT_B", "Memory Control", "VRAM-B Bank Control"),
+    (0x4000242, "REG_VRAMCNT_C", "Memory Control", "VRAM-C Bank Control"),
+    (0x4000243, "REG_VRAMCNT_D", "Memory Control", "VRAM-D Bank Control"),
+    (0x4000244, "REG_VRAMCNT_E", "Memory Control", "VRAM-E Bank Control"),
+    (0x4000245, "REG_VRAMCNT_F", "Memory Control", "VRAM-F Bank Control"),
+    (0x4000246, "REG_VRAMCNT_G", "Memory Control", "VRAM-G Bank Control"),
+    (0x4000247, "REG_WRAMCNT", "Memory Control", "WRAM Bank Control"),
+    (0x4000248, "REG_VRAMCNT_H", "Memory Control", "VRAM-H Bank Control"),
+    (0x4000249, "REG_VRAMCNT_I", "Memory Control", "VRAM-I Bank Control"),
+    (0x4000280, "REG_DIVCNT", "Math", "Division Control"),
+    (0x4000290, "REG_DIV_NUMER", "Math", "Division Numerator (64-bit)"),
+    (0x4000298, "REG_DIV_DENOM", "Math", "Division Denominator (64-bit)"),
+    (0x40002A0, "REG_DIV_RESULT", "Math", "Division Quotient Result (64-bit)"),
+    (0x40002A8, "REG_DIVREM_RESULT", "Math", "Division Remainder Result (64-bit)"),
+    (0x40002B0, "REG_SQRTCNT", "Math", "Square Root Control"),
+    (0x40002B4, "REG_SQRT_RESULT", "Math", "Square Root Result (32-bit)"),
+    (0x40002B8, "REG_SQRT_PARAM", "Math", "Square Root Parameter (64-bit)"),
+    (0x4000304, "REG_POWCNT1", "Power", "Graphics/System Power Control 1"),
+    # 3D Engine Registers (0x4000320 - 0x40006A3) - Define start/end tags
+    (0x4000320, "NDS9_3D_REGS_START", "3D Engine", "NDS 3D Registers Start"),
+    (
+        0x40006A3,
+        "NDS9_3D_REGS_END",
+        "3D Engine",
+        "NDS 3D Registers End",
+    ),  # GBATEK doesn't specify end, using last known
+    # Engine B Registers
+    (0x4001000, "REG_DISPCNT_B", "Display", "Display Control (Engine B)"),
+    (0x4001008, "REG_BG0CNT_B", "Display", "BG0 Control (Engine B)"),
+    (0x400100A, "REG_BG1CNT_B", "Display", "BG1 Control (Engine B)"),
+    (0x400100C, "REG_BG2CNT_B", "Display", "BG2 Control (Engine B)"),
+    (0x400100E, "REG_BG3CNT_B", "Display", "BG3 Control (Engine B)"),
+    (0x4001010, "REG_BG0HOFS_B", "Display", "BG0 X-Offset (Engine B)"),
+    (0x4001012, "REG_BG0VOFS_B", "Display", "BG0 Y-Offset (Engine B)"),
+    (0x4001014, "REG_BG1HOFS_B", "Display", "BG1 X-Offset (Engine B)"),
+    (0x4001016, "REG_BG1VOFS_B", "Display", "BG1 Y-Offset (Engine B)"),
+    (0x4001018, "REG_BG2HOFS_B", "Display", "BG2 X-Offset (Engine B)"),
+    (0x400101A, "REG_BG2VOFS_B", "Display", "BG2 Y-Offset (Engine B)"),
+    (0x400101C, "REG_BG3HOFS_B", "Display", "BG3 X-Offset (Engine B)"),
+    (0x400101E, "REG_BG3VOFS_B", "Display", "BG3 Y-Offset (Engine B)"),
+    (0x4001020, "REG_BG2PA_B", "Display", "BG2 Rot/Scale Param A (dx) (Engine B)"),
+    (0x4001022, "REG_BG2PB_B", "Display", "BG2 Rot/Scale Param B (dmx) (Engine B)"),
+    (0x4001024, "REG_BG2PC_B", "Display", "BG2 Rot/Scale Param C (dy) (Engine B)"),
+    (0x4001026, "REG_BG2PD_B", "Display", "BG2 Rot/Scale Param D (dmy) (Engine B)"),
+    (0x4001028, "REG_BG2X_B", "Display", "BG2 Reference Point X (Engine B)"),
+    (0x400102C, "REG_BG2Y_B", "Display", "BG2 Reference Point Y (Engine B)"),
+    (0x4001030, "REG_BG3PA_B", "Display", "BG3 Rot/Scale Param A (dx) (Engine B)"),
+    (0x4001032, "REG_BG3PB_B", "Display", "BG3 Rot/Scale Param B (dmx) (Engine B)"),
+    (0x4001034, "REG_BG3PC_B", "Display", "BG3 Rot/Scale Param C (dy) (Engine B)"),
+    (0x4001036, "REG_BG3PD_B", "Display", "BG3 Rot/Scale Param D (dmy) (Engine B)"),
+    (0x4001038, "REG_BG3X_B", "Display", "BG3 Reference Point X (Engine B)"),
+    (0x400103C, "REG_BG3Y_B", "Display", "BG3 Reference Point Y (Engine B)"),
+    (0x4001040, "REG_WIN0H_B", "Display", "Window 0 Horizontal Dimensions (Engine B)"),
+    (0x4001042, "REG_WIN1H_B", "Display", "Window 1 Horizontal Dimensions (Engine B)"),
+    (0x4001044, "REG_WIN0V_B", "Display", "Window 0 Vertical Dimensions (Engine B)"),
+    (0x4001046, "REG_WIN1V_B", "Display", "Window 1 Vertical Dimensions (Engine B)"),
+    (0x4001048, "REG_WININ_B", "Display", "Inside Window 0/1 Control (Engine B)"),
+    (
+        0x400104A,
+        "REG_WINOUT_B",
+        "Display",
+        "Inside OBJ/Outside Window Control (Engine B)",
+    ),
+    (0x400104C, "REG_MOSAIC_B", "Display", "Mosaic Size (Engine B)"),
+    (0x4001050, "REG_BLDCNT_B", "Display", "Color Special Effects Control (Engine B)"),
+    (0x4001052, "REG_BLDALPHA_B", "Display", "Alpha Blending Coefficients (Engine B)"),
+    (0x4001054, "REG_BLDY_B", "Display", "Brightness Coefficient (Engine B)"),
+    (0x400106C, "REG_MASTER_BRIGHT_B", "Display", "Master Brightness (Engine B)"),
+    # --- arm7 specific i/o registers ---
+    (0x4000136, "REG_EXTKEYIN", "Keypad", "Extended Key Input (Lid, etc.)"),
+    (0x4000138, "REG_RTCDATA", "RTC", "RTC Data Register (via SPI)"),
+    (0x40001C0, "REG_SPICNT", "SPI", "SPI Control (Firmware, Touchscreen, Powerman)"),
+    (0x40001C2, "REG_SPIDATA", "SPI", "SPI Data"),
+    (
+        0x4000204,
+        "REG_EXMEMSTAT",
+        "Memory Control",
+        "External Memory Status (Read Only)",
+    ),
+    (0x4000240, "REG_VRAMSTAT", "Memory Control", "VRAM C,D Bank Status"),
+    (0x4000241, "REG_WRAMSTAT", "Memory Control", "WRAM Bank Status"),
+    (0x4000304, "REG_POWCNT2", "Power", "Sound/Wifi Power Control 2"),
+    (0x4000308, "REG_BIOSPROT", "System", "BIOS Write Protection"),
+    # Sound Registers (0x4000400 - 0x400051C) - Define start/end tags
+    (0x4000400, "NDS7_SOUND_REGS_START", "Sound", "NDS Sound Registers Start"),
+    (
+        0x400051F,
+        "NDS7_SOUND_REGS_END",
+        "Sound",
+        "NDS Sound Registers End",
+    ),  # End is inclusive? Using +1
+    (0x4000500, "REG_SOUNDCNT", "Sound", "Sound Control Register"),
+    (0x4000504, "REG_SOUNDBIAS", "Sound", "Sound Bias Register"),
+    (0x4000508, "REG_SNDCAP0CNT", "Sound", "Sound Capture 0 Control"),
+    (0x4000509, "REG_SNDCAP1CNT", "Sound", "Sound Capture 1 Control"),
+    (0x4000510, "REG_SNDCAP0DAD", "Sound", "Sound Capture 0 Destination Address"),
+    (0x4000514, "REG_SNDCAP0LEN", "Sound", "Sound Capture 0 Length"),
+    (0x4000518, "REG_SNDCAP1DAD", "Sound", "Sound Capture 1 Destination Address"),
+    (0x400051C, "REG_SNDCAP1LEN", "Sound", "Sound Capture 1 Length"),
+    # Wifi Registers (0x480xxxx) - Define start/end tags
+    (0x4800000, "NDS7_WIFI_REGS_START", "Wifi", "NDS Wifi Registers Start"),
+    (
+        0x480FFFF,
+        "NDS7_WIFI_REGS_END",
+        "Wifi",
+        "NDS Wifi Registers End",
+    ),  # End is inclusive? Using +1
+    # --- hardcoded ram addresses ---
+    (
+        0x0380FFF8,
+        "NDS7_IRQ_CHECKBITS",
+        "Hardcoded Addr",
+        "ARM7 IRQ 'IF' Check Bits Mirror?",
+    ),
+    (
+        0x0380FFFC,
+        "NDS7_IRQ_HANDLER_PTR",
+        "Hardcoded Addr",
+        "ARM7 Pointer to IRQ Handler",
+    ),
+    (0x027FFFFE, "MAIN_MEM_CNT", "Hardcoded Addr", "Main Memory Control?"),
+    # Add DTCM addresses if DTCM base is known/fixed
+    # (0xDTCM_BASE + 0x3FF8, "NDS9_IRQ_CHECKBITS", "Hardcoded Addr", "ARM9 IRQ Check Bits"),
+    # (0xDTCM_BASE + 0x3FFC, "NDS9_IRQ_HANDLER_PTR", "Hardcoded Addr", "ARM9 IRQ Handler"),
+]
+
+
+# --- ndsview class definition ---
 
 
 class NDSView(BinaryView):
-    name = "NDS"
-    long_name = "Nintendo DS"
+    """
+    BinaryView class for loading and analyzing Nintendo DS ROM files.
+    """
 
-    # segment permission flags
+    name = "NDS"
+    long_name = "Nintendo DS ROM"
+
+    # --- segment permission flags ---
+    # combine basic permissions for common scenarios
     RWX_FLAGS: SegmentFlag = (
         SegmentFlag.SegmentReadable
         | SegmentFlag.SegmentWritable
@@ -59,221 +329,300 @@ class NDSView(BinaryView):
     )
     RW_FLAGS: SegmentFlag = SegmentFlag.SegmentReadable | SegmentFlag.SegmentWritable
     RX_FLAGS: SegmentFlag = SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable
+    R_FLAGS: SegmentFlag = SegmentFlag.SegmentReadable
 
-    def __init__(self, parent: BinaryView):
-        """initializes the ndsview instance."""
-        BinaryView.__init__(self, file_metadata=parent.file, parent_view=parent)
-        self.log: Logger = self.create_logger("NDS")
-        self.raw: BinaryView = parent  # the raw parent binaryview (data source)
-        self.nds_rom: Optional[NDSRom] = None  # stores parsed rom data
-        self._created_tag_types: Dict[str, TagType] = {}  # cache created tag types
+    def __init__(self, data: BinaryView):
+        """
+        initializes the NDSView instance. minimal setup here.
+        args:
+            data: the BinaryView object containing the raw nds rom data.
+        """
+        # --- initialize the base binaryview *first* ---
+        BinaryView.__init__(self, file_metadata=data.file, parent_view=data)
 
-    @staticmethod
-    def is_valid_for_data(data: BinaryView) -> bool:
+        # --- initialize instance variables *after* successful base init ---
+        self.raw: BinaryView = data  # keep a reference to the raw data view
+        self.log: Logger = self.create_logger("NDS")  # use "NDS" logger name.
+        self._created_tag_types: Dict[str, TagType] = {}  # cache for created TagTypes.
+        self.nds_rom: Optional[NDSRom] = None  # store parsed rom data
+
+        # set architecture and platform (nds uses armv7 with thumb extensions)
+        try:
+            self.arch: Architecture = Architecture["armv7"]  # type: ignore
+            self.platform: Platform = self.arch.standalone_platform  # type: ignore
+            if not self.platform:
+                log_error(
+                    "[NDS] critical: could not get standalone platform for armv7."
+                )
+                raise RuntimeError("failed to get armv7 platform.")
+            log_info(
+                f"[NDS] using platform: {self.platform.name}, architecture: {self.arch.name}"
+            )
+        except KeyError:
+            log_error("[NDS] critical: armv7 architecture not found.")
+            raise RuntimeError("armv7 architecture not found.")
+        except Exception as e:
+            log_error(f"[NDS] critical error setting platform/arch: {e}")
+            raise
+
+    @classmethod
+    def is_valid_for_data(cls, data: BinaryView) -> bool:
         """
         checks if the data is likely an nds rom using a basic heuristic.
         the full validation (crc checks) is deferred to the init method.
+        args:
+            data: the BinaryView object containing the data.
+        returns:
+            true if the data is likely an nds rom, false otherwise.
         """
         try:
-            # read enough data for a basic check (e.g., nintendo logo)
-            header_start: bytes = data.read(
-                0, 0xC4
-            )  # read up to the start of the logo + a few bytes
-            if len(header_start) < 0xC4:
+            # check for minimum header size needed for the logo magic
+            if data.length < 0xC4:
                 return False
 
             # check the first few bytes of the nintendo logo at 0xc0
-            if header_start[0xC0:0xC4] == b"\x24\xff\xae\x51":
+            logo_magic = data.read(0xC0, 4)
+            if logo_magic == b"\x24\xff\xae\x51":
+                log_info("[NDS] validation: found nintendo logo magic bytes.")
                 return True  # assume valid for now, full check in init()
             else:
+                # log_warn("[NDS] validation: nintendo logo magic bytes mismatch.") # can be noisy
                 return False
         except Exception as e:
             log_error(
-                f"[NDS] Error during basic validation check: {e}\n{traceback.format_exc()}"
+                f"[NDS] error during basic validation check: {e}\n{traceback.format_exc()}"
             )
-            return False
-
-    def init(self) -> bool:
-        """
-        initializes the nds view.
-        performs full validation, parses the rom header, maps memory segments,
-        loads arm9/arm7 binaries and overlays, and defines hardware symbols.
-        returns true on success, false on failure.
-        """
-        try:
-            self.log.log_info("reading entire rom into memory for header parsing...")
-            # read the entire rom content into memory because ndsromreader expects bytes
-            rom_length = self.raw.length
-            rom_data_bytes: bytes = self.raw.read(0, rom_length)
-            if not rom_data_bytes or len(rom_data_bytes) != rom_length:
-                self.log.log_error(
-                    f"failed to read full rom data ({len(rom_data_bytes)} read vs {rom_length} expected) from parent view."
-                )
-                return False
-
-            # --- perform full validation here ---
-            self.log.log_info("performing full header validation...")
-            if not NDSRomReader.is_valid(rom_data_bytes[:0x160]):
-                self.log.log_error(
-                    "full header validation failed via ndsromreader.is_valid."
-                )
-                self.log.log_warn("continuing load despite header validation failure.")
-            else:
-                self.log.log_info("full header validation successful.")
-            # ------------------------------------
-
-            self.log.log_info("parsing nds rom structure using ndsromreader...")
-            self.nds_rom = NDSRomReader.read(rom_data_bytes)
-            del rom_data_bytes  # free memory
-
-            if not self.nds_rom:
-                self.log.log_error(
-                    "failed to parse nds rom header and structures (NDSRomReader.read returned None)."
-                )
-                return False
-
-            # set architecture and platform
-            self.arch: Architecture = Architecture["armv7"]  # type: ignore
-            self.platform: Platform = Architecture["armv7"].standalone_platform  # type: ignore
-
-            self.log.log_info("mapping nds memory segments...")
-            self._map_memory_segments()
-
-            self.log.log_info("loading arm9 binary...")
-            self._init_arm9(try_decompress=True)
-
-            self.log.log_info("loading arm7 binary...")
-            self._init_arm7()
-
-            self.log.log_info("loading arm9 overlays...")
-            self._load_overlays("ARM9", self.nds_rom.arm9_overlay_table)
-
-            self.log.log_info("loading arm7 overlays...")
-            self._load_overlays("ARM7", self.nds_rom.arm7_overlay_table)
-
-            # load debug info if present
-            if (
-                self.nds_rom.header.debug_rom_offset != 0
-                and self.nds_rom.header.debug_size > 0
-            ):
-                self.log.log_info("loading debug arm9 binary...")
-                self._init_debug_arm9()
-
-            self.log.log_info("defining nds hardware symbols and tags...")
-            self._define_symbols_and_tags()  # renamed method
-
-            # --- force analysis update ---
-            self.log.log_info("updating analysis...")
-            self.update_analysis_and_wait()
-            # ---------------------------
-
-            self.log.log_info("nds rom loading complete.")
-            return True
-        except Exception as e:  # catch specific exceptions if possible
-            self.log.log_error(f"failed to initialize ndsview: {e}")
-            self.log.log_error(traceback.format_exc())
             return False
 
     # --- helper methods ---
 
+    def _parse_rom_header(self) -> bool:
+        """
+        parses the nds rom header using ndsromreader.
+        performs full validation and stores the result in self.nds_rom.
+        returns true on success, false on failure.
+        """
+        self.log.log_info("reading entire rom into memory for header parsing...")
+        rom_length = self.raw.length
+        rom_data_bytes: bytes = self.raw.read(0, rom_length)
+        if not rom_data_bytes or len(rom_data_bytes) != rom_length:
+            self.log.log_error(
+                f"failed to read full rom data ({len(rom_data_bytes)} read vs {rom_length} expected) from parent view."
+            )
+            return False
+
+        # --- perform full validation here ---
+        self.log.log_info("performing full header validation...")
+        # use a larger chunk for validation if needed by is_valid
+        validation_size = min(0x1000, rom_length)  # e.g., first 4kb
+        if not NDSRomReader.is_valid(rom_data_bytes[:validation_size]):
+            self.log.log_error(
+                "full header validation failed via ndsromreader.is_valid."
+            )
+            self.log.log_warn(
+                "continuing load despite header validation failure."
+            )  # or return false for strictness
+        else:
+            self.log.log_info("full header validation successful.")
+        # ------------------------------------
+
+        self.log.log_info("parsing nds rom structure using ndsromreader...")
+        self.nds_rom = NDSRomReader.read(rom_data_bytes)
+        del rom_data_bytes  # free memory after parsing
+
+        if not self.nds_rom or not self.nds_rom.header:
+            self.log.log_error(
+                "failed to parse nds rom header and structures (NDSRomReader.read returned None or header missing)."
+            )
+            return False
+        return True
+
+    def _define_tag_types(self):
+        """
+        defines and caches all necessary tag types used by this view.
+        iterates through the global NDS_TAG_TYPES dictionary.
+        """
+        self.log.log_info("defining nds hardware tag types...")
+        for name, icon in NDS_TAG_TYPES.items():
+            self._get_or_create_tag_type(name, icon)
+
     def _get_or_create_tag_type(self, name: str, icon: str) -> Optional[TagType]:
-        """gets or creates a tag type, caching the result."""
-        if name in self._created_tag_types:
-            return self._created_tag_types[name]
-        if name in self.tag_types:
-            tag_type = self.tag_types[name]
-            # Handle case where tag_types might return a list (shouldn't happen for unique names)
+        """
+        gets or creates a tag type, caching the result. avoids redundant api calls.
+        args:
+            name: the name of the tag type (e.g., "Memory Region"). use proper case.
+            icon: the icon (emoji) for the tag type (e.g., "🗺️").
+        returns:
+            the TagType object or none if creation failed.
+        """
+        # use lowercase for internal caching/lookup key
+        name_lower = name.lower()
+        # check cache first.
+        if name_lower in self._created_tag_types:
+            return self._created_tag_types[name_lower]
+
+        # check if tag type already exists in the view.
+        if name_lower in self.tag_types:
+            tag_type = self.tag_types[name_lower]
             if isinstance(tag_type, list):
-                if tag_type:
-                    self._created_tag_types[name] = tag_type[0]
-                    return tag_type[0]
-                else:
-                    # Should not happen, but handle gracefully
-                    self.log.log_error(
-                        f"tag type '{name}' returned empty list unexpectedly."
-                    )
-                    return None
-            else:
-                self._created_tag_types[name] = tag_type
+                tag_type = tag_type[0] if tag_type else None
+            if tag_type:
+                self.log.log_info(f"found existing TagType '{name_lower}'.")
+                self._created_tag_types[name_lower] = tag_type
                 return tag_type
+            else:
+                self.log.log_error(
+                    f"TagType '{name_lower}' exists but api returned empty list/none."
+                )
+                pass  # proceed to creation block.
+
+        # if not found or api returned none unexpectedly, create it.
         try:
+            # use the original (proper) casing for the name when creating.
+            self.log.log_info(f"creating new TagType '{name}' with icon '{icon}'.")
             tag_type = self.create_tag_type(name, icon)
-            self._created_tag_types[name] = tag_type
+            self._created_tag_types[name_lower] = tag_type  # cache using lowercase key.
             return tag_type
         except Exception as e:
-            self.log.log_error(f"failed to create tag type '{name}': {e}")
+            self.log.log_error(f"failed to create TagType '{name}': {e}")
             return None
 
     def _define_reg_with_tag(
         self,
         address: int,
-        name: str,
-        tag_type_name: str,
+        name: str,  # use proper case for symbol name
+        tag_type_name: str,  # use proper case for tag type name
         tag_type_icon: str,
-        description: str = "",
+        description: str = "",  # use proper case for description
     ):
-        """helper to define a register symbol and apply a tag."""
-        # define the symbol
-        self.define_auto_symbol(Symbol(SymbolType.DataSymbol, address, name))  # type: ignore
-        if description:
-            self.set_comment_at(address, description)
+        """
+        helper to define a hardware register symbol and apply a descriptive tag.
+        args:
+            address: the memory address of the register.
+            name: the name of the register (symbol name, e.g., "REG_DISPSTAT").
+            tag_type_name: the name of the tag type to apply (e.g., "Display").
+            tag_type_icon: the icon for the tag type (used if creating the type).
+            description: an optional comment for the register.
+        """
+        try:
+            # define the symbol at the specified address.
+            self.define_auto_symbol(Symbol(SymbolType.DataSymbol, address, name))
 
-        # get or create the tag type
-        tag_type = self._get_or_create_tag_type(tag_type_name, tag_type_icon)
+            # add the comment if provided.
+            if description:
+                self.set_comment_at(address, description)
 
-        # add the tag if the type exists
-        if tag_type:
-            try:
-                self.add_tag(address, tag_type, data="")  # data can be empty or name
-            except Exception as e:
-                # log if adding tag fails, but don't stop loading
-                self.log.log_error(
-                    f"failed to add tag '{tag_type_name}' at 0x{address:x} for {name}: {e}"
-                )
+            # get or create the tag type using the helper. pass proper case name.
+            tag_type = self._get_or_create_tag_type(tag_type_name, tag_type_icon)
 
-    # --- memory mapping ---
+            # add the tag to the address if the tag type was successfully obtained/created.
+            if tag_type:
+                # use the register name as the tag data for easy identification in ui.
+                self.add_tag(address, tag_type, data=name)
+        except Exception as e:
+            # log if defining symbol or adding tag fails, but don't stop the loading process.
+            self.log.log_error(
+                f"failed processing register '{name}' at 0x{address:x}: {e}"
+            )
 
-    def _map_memory_segments(self):
-        """maps the core nds memory regions."""
-        # add comments for clarity
-        self.add_auto_segment(0x02000000, 0x00400000, 0, 0, self.RWX_FLAGS)
-        self.set_comment_at(0x02000000, "Main RAM (4MB)")
-        self.add_auto_segment(0x03000000, 0x00008000, 0, 0, self.RWX_FLAGS)
-        self.set_comment_at(0x03000000, "Shared WRAM (32KB)")
-        self.add_auto_segment(0x037F8000, 0x00008000, 0, 0, self.RWX_FLAGS)
-        self.set_comment_at(0x037F8000, "Shared WRAM Mirror")
-        self.add_auto_segment(0x03800000, 0x00010000, 0, 0, self.RWX_FLAGS)
-        self.set_comment_at(0x03800000, "ARM7 WRAM (64KB)")
-        self.add_auto_segment(0x04000000, 0x00001000, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x04000000, "I/O Registers (Main Block)")
-        self.add_auto_segment(0x040001A0, 0x000000C0, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x040001A0, "I/O Registers (Cart/IPC/SPI)")
-        self.add_auto_segment(0x04000200, 0x00000100, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x04000200, "I/O Registers (Mem/IRQ/Math)")
-        self.add_auto_segment(0x04000300, 0x00000100, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x04000300, "I/O Registers (Power/GFX)")
-        self.add_auto_segment(0x04000400, 0x00000200, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x04000400, "I/O Registers (Sound)")
-        self.add_auto_segment(0x04001000, 0x00000100, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x04001000, "I/O Registers (Engine B)")
-        self.add_auto_segment(0x04100000, 0x00000020, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x04100000, "IPC FIFO / Card Data")
-        self.add_auto_segment(0x05000000, 0x00001000, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x05000000, "Palette RAM (4KB)")
-        self.add_auto_segment(0x06000000, 0x000A4000, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x06000000, "VRAM (656KB)")
-        self.add_auto_segment(0x06800000, 0x000A4000, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x06800000, "VRAM LCDC Mirror")
-        self.add_auto_segment(0x07000000, 0x00001000, 0, 0, self.RW_FLAGS)
-        self.set_comment_at(0x07000000, "OAM (4KB)")
-        self.add_auto_segment(0xFFFF0000, 0x00004000, 0, 0, self.RX_FLAGS)
-        self.set_comment_at(0xFFFF0000, "ARM9 BIOS (16KB)")
+    def _map_memory_regions(self):
+        """maps the core nds memory regions (ram, vram, io, etc.)."""
+        self.log.log_info("mapping nds memory regions...")
 
-    # --- binary loading ---
+        # helper function to add segment and associated tag/comment.
+        def add_memory_region(
+            addr, size, perms, name, tag_name="Memory Region", tag_icon="🗺️"
+        ):
+            self.log.log_info(f"  mapping {name}: addr=0x{addr:08x}, size=0x{size:x}")
+            # add the segment with zero offset/length from the file (it's ram or io).
+            self.add_auto_segment(addr, size, 0, 0, perms)
+            # get the tag type (use proper case name).
+            tag_type = self._get_or_create_tag_type(tag_name, tag_icon)
+            if tag_type:
+                # add tag at the start of the region.
+                self.add_tag(addr, tag_type, data=f"{name} Start")
+            # add comment at the start of the region (proper case allowed here).
+            self.set_comment_at(addr, f"{name} ({size // 1024}KB)")
 
-    def _init_arm9(self, try_decompress=True):
-        """loads the main arm9 binary, optionally decompressing it."""
-        if not self.nds_rom:
+        # main ram
+        add_memory_region(0x02000000, 0x00400000, self.RWX_FLAGS, "Main RAM")
+        # shared wram
+        add_memory_region(0x03000000, 0x00008000, self.RWX_FLAGS, "Shared WRAM")
+        add_memory_region(0x037F8000, 0x00008000, self.RWX_FLAGS, "Shared WRAM Mirror")
+        # arm7 wram
+        add_memory_region(0x03800000, 0x00010000, self.RWX_FLAGS, "ARM7 WRAM")
+        # i/o registers
+        add_memory_region(
+            0x04000000,
+            0x00001000,
+            self.RW_FLAGS,
+            "I/O Registers (Main Block)",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )
+        add_memory_region(
+            0x040001A0,
+            0x000000C0,
+            self.RW_FLAGS,
+            "I/O Registers (Cart/IPC/SPI)",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )
+        add_memory_region(
+            0x04000200,
+            0x00000100,
+            self.RW_FLAGS,
+            "I/O Registers (Mem/IRQ/Math)",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )
+        add_memory_region(
+            0x04000300,
+            0x00000100,
+            self.RW_FLAGS,
+            "I/O Registers (Power/GFX)",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )
+        add_memory_region(
+            0x04000400,
+            0x00000200,
+            self.RW_FLAGS,
+            "I/O Registers (Sound)",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )
+        add_memory_region(
+            0x04001000,
+            0x00000100,
+            self.RW_FLAGS,
+            "I/O Registers (Engine B)",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )
+        add_memory_region(
+            0x04100000,
+            0x00000020,
+            self.RW_FLAGS,
+            "IPC FIFO / Card Data",
+            tag_name="Hardware Register",
+            tag_icon="🔩",
+        )
+        # palette ram
+        add_memory_region(0x05000000, 0x00001000, self.RW_FLAGS, "Palette RAM")
+        # vram
+        add_memory_region(0x06000000, 0x000A4000, self.RW_FLAGS, "VRAM")
+        add_memory_region(0x06800000, 0x000A4000, self.RW_FLAGS, "VRAM LCDC Mirror")
+        # oam
+        add_memory_region(0x07000000, 0x00001000, self.RW_FLAGS, "OAM")
+        # arm9 bios
+        add_memory_region(0xFFFF0000, 0x00004000, self.RX_FLAGS, "ARM9 BIOS")
+        # arm7 bios is typically at 0x00000000, but that's handled by arm7 loading
+
+    def _load_arm9(self):
+        """loads the main arm9 binary, handling decompression and adding sections."""
+        if not self.nds_rom or not self.nds_rom.header:
+            self.log.log_error("cannot load arm9, rom header not parsed.")
             return
 
         header = self.nds_rom.header
@@ -281,7 +630,7 @@ class NDSView(BinaryView):
             self.log.log_info("arm9 size is 0, skipping.")
             return
 
-        # read the raw arm9 data directly from the parent view
+        self.log.log_info("loading arm9 binary...")
         arm9_data_raw: bytes = self.raw.read(header.arm9_rom_offset, header.arm9_size)
         if not arm9_data_raw:
             self.log.log_error(
@@ -293,62 +642,85 @@ class NDSView(BinaryView):
         final_size = header.arm9_size
         decompressed = False
 
-        if try_decompress:
-            try:
-                decompressed_data = self._mii_uncompress_backward(arm9_data_raw)
-                # use decompressed data if it's different (check size)
-                if len(decompressed_data) != len(arm9_data_raw):
-                    final_arm9_data = decompressed_data
-                    final_size = len(decompressed_data)
-                    decompressed = True
-                    self.log.log_info(
-                        f"decompressed arm9: {header.arm9_size} bytes -> {final_size} bytes"
-                    )
-                else:
-                    self.log.log_info(
-                        "arm9 appears uncompressed or decompression yielded same data."
-                    )
-            except Exception as e:
-                self.log.log_warn(f"arm9 decompression failed: {e}. using raw data.")
+        # try decompression
+        try:
+            decompressed_data = self._mii_uncompress_backward(arm9_data_raw)
+            if len(decompressed_data) != len(arm9_data_raw):
+                final_arm9_data = decompressed_data
+                final_size = len(decompressed_data)
+                decompressed = True
+                self.log.log_info(
+                    f"decompressed arm9: {header.arm9_size} bytes -> {final_size} bytes"
+                )
+            else:
+                self.log.log_info(
+                    "arm9 appears uncompressed or decompression yielded same data."
+                )
+        except Exception as e:
+            self.log.log_warn(f"arm9 decompression failed: {e}. using raw data.")
 
         # add segment and load data
+        load_address = header.arm9_ram_address
         if decompressed:
             # if decompressed, size changed, so add segment then write
             self.add_auto_segment(
-                header.arm9_ram_address, final_size, 0, final_size, self.RX_FLAGS
+                load_address, final_size, 0, final_size, self.RX_FLAGS
             )
-            bytes_written = self.write(header.arm9_ram_address, final_arm9_data)
+            bytes_written = self.write(load_address, final_arm9_data)
             if bytes_written != final_size:
                 self.log.log_error(
                     f"arm9 write error (decompressed): expected {final_size}, wrote {bytes_written}"
                 )
+                return  # fail if write fails
         else:
             # if not decompressed, map directly from file
             self.add_auto_segment(
-                header.arm9_ram_address,
+                load_address,
                 final_size,
                 header.arm9_rom_offset,
                 final_size,
                 self.RX_FLAGS,
             )
 
-        # define entry point and function
-        self.add_entry_point(header.arm9_entry_address)
-        self.define_auto_symbol(
-            Symbol(SymbolType.FunctionSymbol, header.arm9_entry_address, "_start9")
-        )  # type: ignore
-        self.add_function(header.arm9_entry_address)
-        self.set_comment_at(header.arm9_ram_address, "ARM9 Binary Start")
+        # add section for analysis
+        self.add_auto_section(
+            name=".arm9",  # simple name for the main binary
+            start=load_address,
+            length=final_size,
+            semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,
+            type="Code",
+        )
 
+        self.set_comment_at(
+            load_address,
+            f"ARM9 Binary Start{' (Decompressed)' if decompressed else ''}",
+        )
         self.log.log_info(
-            f"arm9 loaded: entry=0x{header.arm9_entry_address:08x}, load=0x{header.arm9_ram_address:08x}, "
+            f"arm9 loaded: entry=0x{header.arm9_entry_address:08x}, load=0x{load_address:08x}, "
             f"size=0x{final_size:x}, offset=0x{header.arm9_rom_offset:08x} {'(decompressed)' if decompressed else '(raw mapped)'}"
         )
-        # TODO: handle arm9 bss
 
-    def _init_arm7(self):
-        """loads the main arm7 binary. arm7 is typically not compressed."""
-        if not self.nds_rom:
+        # handle arm9 bss
+        arm9_bss_size = getattr(header, "arm9_bss_size", 0)  # Get BSS size if available
+        if arm9_bss_size > 0:
+            bss_start = load_address + final_size
+            self.log.log_info(
+                f"  mapping arm9 bss: addr=0x{bss_start:08x}, size=0x{arm9_bss_size:x}"
+            )
+            self.add_auto_segment(bss_start, arm9_bss_size, 0, 0, self.RW_FLAGS)
+            self.add_auto_section(
+                name=".arm9.bss",
+                start=bss_start,
+                length=arm9_bss_size,
+                semantics=SectionSemantics.ReadWriteDataSectionSemantics,
+                type="BSS",
+            )
+            self.set_comment_at(bss_start, "ARM9 BSS Start")
+
+    def _load_arm7(self):
+        """loads the main arm7 binary and adds section."""
+        if not self.nds_rom or not self.nds_rom.header:
+            self.log.log_error("cannot load arm7, rom header not parsed.")
             return
 
         header = self.nds_rom.header
@@ -356,73 +728,68 @@ class NDSView(BinaryView):
             self.log.log_info("arm7 size is 0, skipping loading.")
             return
 
+        self.log.log_info("loading arm7 binary...")
         # arm7 is usually not compressed, map directly from file
+        load_address = header.arm7_ram_address
         final_size = header.arm7_size
         self.add_auto_segment(
-            header.arm7_ram_address,
-            final_size,
-            header.arm7_rom_offset,
-            final_size,
-            self.RX_FLAGS,
+            load_address, final_size, header.arm7_rom_offset, final_size, self.RX_FLAGS
         )
 
-        # define entry point and function
-        self.add_entry_point(header.arm7_entry_address)
-        self.define_auto_symbol(
-            Symbol(SymbolType.FunctionSymbol, header.arm7_entry_address, "_start7")
-        )  # type: ignore
-        self.add_function(header.arm7_entry_address)
-        self.set_comment_at(header.arm7_ram_address, "ARM7 Binary Start")
+        # add section for analysis
+        self.add_auto_section(
+            name=".arm7",  # simple name for the main binary
+            start=load_address,
+            length=final_size,
+            semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,
+            type="Code",
+        )
 
+        self.set_comment_at(load_address, "ARM7 Binary Start")
         self.log.log_info(
-            f"arm7 loaded: entry=0x{header.arm7_entry_address:08x}, load=0x{header.arm7_ram_address:08x}, "
+            f"arm7 loaded: entry=0x{header.arm7_entry_address:08x}, load=0x{load_address:08x}, "
             f"size=0x{final_size:x}, offset=0x{header.arm7_rom_offset:08x} (raw mapped)"
         )
-        # TODO: handle arm7 bss
 
-    def _init_debug_arm9(self):
-        """loads the debug arm9 binary if present."""
-        if not self.nds_rom:
-            return
-
-        header = self.nds_rom.header
-        # debug arm9 is typically not compressed, map directly
-        load_address = header.debug_ram_address
-        if load_address == 0:
-            load_address = 0x02400000
-            self.log.log_warn(
-                f"debug ram address is 0 in header, using default 0x{load_address:08x}"
+        # handle arm7 bss
+        arm7_bss_size = getattr(header, "arm7_bss_size", 0)  # Get BSS size if available
+        if arm7_bss_size > 0:
+            bss_start = load_address + final_size
+            self.log.log_info(
+                f"  mapping arm7 bss: addr=0x{bss_start:08x}, size=0x{arm7_bss_size:x}"
             )
-
-        loaded_size = header.debug_size
-        self.add_auto_segment(
-            load_address,
-            loaded_size,
-            header.debug_rom_offset,
-            loaded_size,
-            self.RX_FLAGS,
-        )
-        self.set_comment_at(load_address, "ARM9 Debug Binary Start")
-
-        self.log.log_info(
-            f"debug arm9 loaded: load=0x{load_address:08x}, size=0x{loaded_size:x}, offset=0x{header.debug_rom_offset:08x} (raw mapped)"
-        )
+            self.add_auto_segment(bss_start, arm7_bss_size, 0, 0, self.RW_FLAGS)
+            self.add_auto_section(
+                name=".arm7.bss",
+                start=bss_start,
+                length=arm7_bss_size,
+                semantics=SectionSemantics.ReadWriteDataSectionSemantics,
+                type="BSS",
+            )
+            self.set_comment_at(bss_start, "ARM7 BSS Start")
 
     def _load_overlays(self, cpu_name: str, overlay_table: Optional[NDSOverlayTable]):
-        """loads arm9 or arm7 overlays. overlays require decompression and writing."""
-        if not self.nds_rom:
-            return
-        if not overlay_table or not overlay_table.entries:
+        """
+        loads arm9 or arm7 overlays, handling decompression and adding segments/sections.
+        args:
+            cpu_name: "ARM9" or "ARM7" for logging/naming.
+            overlay_table: the parsed NDSOverlayTable object.
+        """
+        if not self.nds_rom or not overlay_table or not overlay_table.entries:
+            self.log.log_info(f"no {cpu_name} overlays found or overlay table missing.")
             return
 
+        self.log.log_info(f"loading {cpu_name} overlays...")
         num_loaded = 0
         num_failed = 0
         for i, entry in enumerate(overlay_table.entries):
             if entry.file_id == 0xFFFF or entry.file_id >= len(
                 self.nds_rom.fat_entries
             ):
+                # skip invalid file ids
                 continue
             if entry.ram_size == 0 and entry.bss_size == 0:
+                # skip empty overlays
                 continue
 
             fat_entry = self.nds_rom.fat_entries[entry.file_id]
@@ -476,36 +843,49 @@ class NDSView(BinaryView):
                 segment_ram_size = 0
                 loaded_data = b""
 
-            segment_name = f"{cpu_name}_Overlay_{i}_File{entry.file_id}"
+            segment_name_base = f"{cpu_name}_Overlay_{i}_File{entry.file_id}"
+            load_address = entry.ram_address
+
             # add code/data segment (if size > 0) then write decompressed data
             if segment_ram_size > 0:
                 self.add_auto_segment(
-                    entry.ram_address,
-                    segment_ram_size,
-                    0,
-                    segment_ram_size,
-                    self.RX_FLAGS,
+                    load_address, segment_ram_size, 0, segment_ram_size, self.RX_FLAGS
                 )
-                bytes_written = self.write(
-                    entry.ram_address, loaded_data[:segment_ram_size]
-                )
+                bytes_written = self.write(load_address, loaded_data[:segment_ram_size])
                 if bytes_written != segment_ram_size:
                     self.log.log_error(
-                        f"overlay {segment_name} write error: expected {segment_ram_size}, wrote {bytes_written}"
+                        f"overlay {segment_name_base} write error: expected {segment_ram_size}, wrote {bytes_written}"
                     )
                     num_failed += 1
                     continue  # fail if write fails
+                # add section for the loaded code/data part
+                self.add_auto_section(
+                    name=f".{segment_name_base}",
+                    start=load_address,
+                    length=segment_ram_size,
+                    semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,  # Assume code
+                    type="OverlayCode",
+                )
 
             # add bss segment (if size > 0)
             if entry.bss_size > 0:
-                bss_start_address = entry.ram_address + segment_ram_size
+                bss_start_address = load_address + segment_ram_size
                 self.add_auto_segment(
                     bss_start_address, entry.bss_size, 0, 0, self.RW_FLAGS
                 )
+                # add section for bss
+                self.add_auto_section(
+                    name=f".{segment_name_base}.bss",
+                    start=bss_start_address,
+                    length=entry.bss_size,
+                    semantics=SectionSemantics.ReadWriteDataSectionSemantics,
+                    type="OverlayBSS",
+                )
+                self.set_comment_at(bss_start_address, f"{segment_name_base} BSS Start")
 
             self.set_comment_at(
-                entry.ram_address,
-                f"{cpu_name} overlay {i} (file id: {entry.file_id}){' (decompressed)' if decompressed else ''}",
+                load_address,
+                f"{segment_name_base} Start{' (Decompressed)' if decompressed else ''}",
             )
 
             # define static initializer function
@@ -513,11 +893,9 @@ class NDSView(BinaryView):
                 init_start = entry.static_initializer_start_address
                 func_addr = init_start & ~1  # ensure word alignment
                 self.add_function(func_addr)
-                self.define_auto_symbol(
-                    Symbol(SymbolType.FunctionSymbol, func_addr, f"{segment_name}_Init")
-                )  # type: ignore
+                self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, func_addr, f"{segment_name_base}_Init"))  # type: ignore
                 self.set_comment_at(
-                    func_addr, f"{cpu_name} overlay {i} static initializer"
+                    func_addr, f"{segment_name_base} Static Initializer"
                 )
                 # TODO: Set thumb mode if init_start & 1 was true
 
@@ -529,28 +907,41 @@ class NDSView(BinaryView):
         )
 
     def _mii_uncompress_backward(self, data: bytes) -> bytes:
-        """decompresses data using mii lz77 variant (backward)."""
+        """
+        decompresses data using mii lz77 variant (backward).
+        raises ValueError or EOFError on failure.
+        """
         if len(data) < 4:
             raise ValueError("data too short for mii decompression footer")
         footer = data[-4:]
         header_val = struct.unpack_from("<I", footer, 0)[0]
         comp_type = (header_val >> 24) & 0xF
-        if comp_type == 1:
+        if comp_type == 1:  # Type 1 LZ77
             decompressed_size = header_val & 0xFFFFFF
-        else:
-            decompressed_size = header_val
+        else:  # Other types (like Huffman) not supported here, assume size is full value
+            # For simplicity, assume uncompressed if not type 1
+            # A more robust implementation would check other types
+            # raise ValueError(f"unsupported mii compression type: {comp_type}")
+            decompressed_size = header_val  # Treat as uncompressed size? Or error?
+
+        if decompressed_size == 0 and len(data) > 4:
+            raise ValueError("decompressed size is zero but data is present.")
         if decompressed_size == 0:
-            return (
-                b""
-                if len(data) == 4
-                else ValueError("decompressed size is zero but data is present.")
-            )
-        if decompressed_size < 0 or decompressed_size > 0x10000000:
+            return b""  # Empty data is valid
+
+        if decompressed_size < 0 or decompressed_size > 0x10000000:  # Sanity check size
             raise ValueError(f"invalid decompressed size: 0x{decompressed_size:x}")
+
+        # Only handle type 1 LZ77 for now
+        if comp_type != 1:
+            self.log.log_warn(
+                f"mii compression type {comp_type} encountered, treating as uncompressed."
+            )
+            return data[:-4]  # Return original data minus footer
 
         result = bytearray(decompressed_size)
         dst_offs = decompressed_size
-        src_offs = len(data) - 4
+        src_offs = len(data) - 4  # Start before footer
 
         while dst_offs > 0:
             if src_offs <= 0:
@@ -559,15 +950,16 @@ class NDSView(BinaryView):
             src_offs -= 1
             for i in range(8):
                 if dst_offs <= 0:
-                    break
-                if (block_header & 0x80) == 0:
+                    break  # Finished decompression
+
+                if (block_header & 0x80) == 0:  # Literal byte
                     if src_offs <= 0:
                         raise EOFError("mii source exhausted (literal)")
                     literal_byte = data[src_offs - 1]
                     src_offs -= 1
                     dst_offs -= 1
                     result[dst_offs] = literal_byte
-                else:
+                else:  # LZ77 copy block
                     if src_offs <= 1:
                         raise EOFError("mii source exhausted (lz77 block)")
                     byte1 = data[src_offs - 1]
@@ -575,427 +967,181 @@ class NDSView(BinaryView):
                     src_offs -= 2
                     length = ((byte1 & 0xF0) >> 4) + 3
                     disp = (((byte1 & 0x0F) << 8) | byte2) + 1
+
                     if dst_offs < length:
                         raise ValueError(
                             f"mii lz77 copy length ({length}) exceeds dest space ({dst_offs})"
                         )
+
                     copy_src_base = dst_offs + disp
-                    if copy_src_base < 0 or copy_src_base > decompressed_size:
-                        raise ValueError(f"mii lz77 invalid displacement ({disp})")
+                    # Check bounds rigorously
+                    if copy_src_base < 0 or copy_src_base + length > decompressed_size:
+                        raise ValueError(
+                            f"mii lz77 copy source offset {copy_src_base} or length {length} out of bounds (disp={disp}, dst_offs={dst_offs}, size={decompressed_size})"
+                        )
+
+                    # Copy bytes carefully, handling potential overlaps
                     for j in range(length):
-                        current_copy_src = copy_src_base + j
-                        if current_copy_src >= decompressed_size:
-                            raise ValueError(
-                                f"mii lz77 copy source offset {current_copy_src} out of bounds"
-                            )
-                        result[dst_offs - 1] = result[current_copy_src]
+                        result[dst_offs - 1] = result[
+                            copy_src_base + j - 1
+                        ]  # Read from potentially already written part
                         dst_offs -= 1
                         if dst_offs <= 0 and j < length - 1:
                             raise EOFError(
                                 "mii destination filled unexpectedly during lz77 copy"
                             )
-                block_header = (block_header << 1) & 0xFF
+
+                block_header = (block_header << 1) & 0xFF  # Move to next bit
+
         if dst_offs != 0:
+            # This might happen if the decompressed size in the footer was wrong
             self.log.log_warn(
-                f"mii decompression: dst_offs non-zero ({dst_offs}) after loop."
+                f"mii decompression: dst_offs non-zero ({dst_offs}) after loop. possible size mismatch."
             )
+
         return bytes(result)
 
-    # --- symbol and tag definitions ---
+    def _define_io_registers(self):
+        """defines symbols and tags for known nds i/o registers."""
+        self.log.log_info("defining nds hardware symbols and tags...")
+        for addr, name, tag_name, desc in NDS_IO_REGISTERS:
+            icon = NDS_TAG_TYPES.get(tag_name, "🔩")  # default icon
+            self._define_reg_with_tag(addr, name, tag_name, icon, desc)
 
-    def _define_symbols_and_tags(self):
-        """defines symbols and tags for known nds hardware registers and memory locations."""
+    def _define_entry_points(self):
+        """defines entry points and start symbols for arm9 and arm7."""
+        if not self.nds_rom or not self.nds_rom.header:
+            self.log.log_error("cannot define entry points, rom header not parsed.")
+            return
 
-        # define tag types first (will be cached in self._created_tag_types)
-        tag_types = {
-            "Display": "🖼️",
-            "DMA": "➡️",
-            "Timers": "⏱️",
-            "Keypad": "🎮",
-            "IPC": "↔️",
-            "Gamecard": "💾",
-            "Interrupts": "⚡",
-            "Power": "🔋",
-            "Memory Control": "🐏",
-            "Math": "➗",
-            "3D Engine": "🧊",
-            "Sound": "🔊",
-            "SPI": "〰️",
-            "RTC": "🕒",
-            "Wifi": "📡",
-            "System": "⚙️",
-            "ARM9 Specific": "9️⃣",
-            "ARM7 Specific": "7️⃣",
-            "Hardcoded Addr": "📍",
-        }
-        for name, icon in tag_types.items():
-            self._get_or_create_tag_type(name, icon)
+        header = self.nds_rom.header
 
-        # --- arm9 and arm7 common i/o registers ---
-        self._define_reg_with_tag(
-            0x4000004,
-            "REG_DISPSTAT",
-            "Display",
-            tag_types["Display"],
-            "display status (shared)",
-        )
-        self._define_reg_with_tag(
-            0x4000006,
-            "REG_VCOUNT",
-            "Display",
-            tag_types["Display"],
-            "vertical counter (shared)",
-        )
-        for i in range(4):  # DMA
-            dma_base = 0x40000B0 + i * 0xC
-            self._define_reg_with_tag(
-                dma_base + 0x0,
-                f"REG_DMA{i}SAD",
-                "DMA",
-                tag_types["DMA"],
-                f"dma {i} source address",
+        # arm9 entry point
+        if header.arm9_size > 0:
+            entry_point = header.arm9_entry_address
+            self.log.log_info(f"defining arm9 entry point: 0x{entry_point:08x}")
+            segment_at_entry = self.get_segment_at(entry_point)
+            if segment_at_entry and segment_at_entry.executable:
+                self.add_entry_point(entry_point)
+                self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, entry_point, "_start9"))  # type: ignore
+                try:
+                    self.add_function(entry_point)
+                except Exception as e:
+                    self.log.log_warn(
+                        f"failed to add function at arm9 entry 0x{entry_point:x}: {e}"
+                    )
+            else:
+                self.log.log_warn(
+                    f"arm9 entry point 0x{entry_point:x} not in executable segment."
+                )
+
+        # arm7 entry point
+        if header.arm7_size > 0:
+            entry_point = header.arm7_entry_address
+            self.log.log_info(f"defining arm7 entry point: 0x{entry_point:08x}")
+            segment_at_entry = self.get_segment_at(entry_point)
+            if segment_at_entry and segment_at_entry.executable:
+                self.add_entry_point(entry_point)
+                self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, entry_point, "_start7"))  # type: ignore
+                try:
+                    self.add_function(entry_point)
+                except Exception as e:
+                    self.log.log_warn(
+                        f"failed to add function at arm7 entry 0x{entry_point:x}: {e}"
+                    )
+            else:
+                self.log.log_warn(
+                    f"arm7 entry point 0x{entry_point:x} not in executable segment."
+                )
+
+        # debug arm9 entry point (if applicable) - typically no defined entry in header
+        if header.debug_rom_offset != 0 and header.debug_size > 0:
+            debug_load_addr = (
+                header.debug_ram_address
+                if header.debug_ram_address != 0
+                else 0x02400000
             )
-            self._define_reg_with_tag(
-                dma_base + 0x4,
-                f"REG_DMA{i}DAD",
-                "DMA",
-                tag_types["DMA"],
-                f"dma {i} destination address",
+            self.log.log_info(
+                f"debug arm9 loaded at 0x{debug_load_addr:08x}, no standard entry point defined."
             )
-            self._define_reg_with_tag(
-                dma_base + 0x8,
-                f"REG_DMA{i}CNT_L",
-                "DMA",
-                tag_types["DMA"],
-                f"dma {i} word count",
+            # maybe add a symbol at the load address?
+            self.define_auto_symbol(
+                Symbol(
+                    SymbolType.DataSymbol, debug_load_addr, "arm9_debug_load_address"
+                )
             )
-            self._define_reg_with_tag(
-                dma_base + 0xA,
-                f"REG_DMA{i}CNT_H",
-                "DMA",
-                tag_types["DMA"],
-                f"dma {i} control",
-            )
-        for i in range(4):  # Timers
-            tmr_base = 0x4000100 + i * 0x4
-            self._define_reg_with_tag(
-                tmr_base + 0x0,
-                f"REG_TM{i}CNT_L",
-                "Timers",
-                tag_types["Timers"],
-                f"timer {i} data/reload",
-            )
-            self._define_reg_with_tag(
-                tmr_base + 0x2,
-                f"REG_TM{i}CNT_H",
-                "Timers",
-                tag_types["Timers"],
-                f"timer {i} control",
-            )
-        self._define_reg_with_tag(
-            0x4000130, "REG_KEYINPUT", "Keypad", tag_types["Keypad"], "key status"
-        )
-        self._define_reg_with_tag(
-            0x4000132,
-            "REG_KEYCNT",
-            "Keypad",
-            tag_types["Keypad"],
-            "key interrupt control",
-        )
-        self._define_reg_with_tag(
-            0x4000180, "REG_IPCSYNC", "IPC", tag_types["IPC"], "ipc synchronize"
-        )
-        self._define_reg_with_tag(
-            0x4000184, "REG_IPCFIFOCNT", "IPC", tag_types["IPC"], "ipc fifo control"
-        )
-        self._define_reg_with_tag(
-            0x4000188,
-            "REG_IPCFIFOSEND",
-            "IPC",
-            tag_types["IPC"],
-            "ipc send fifo (write)",
-        )
-        self._define_reg_with_tag(
-            0x4100000,
-            "REG_IPCFIFORECV",
-            "IPC",
-            tag_types["IPC"],
-            "ipc receive fifo (read)",
-        )
-        self._define_reg_with_tag(
-            0x40001A0,
-            "REG_AUXSPICNT",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "card spi control / rom control",
-        )
-        self._define_reg_with_tag(
-            0x40001A2,
-            "REG_AUXSPIDATA",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "card spi data",
-        )
-        self._define_reg_with_tag(
-            0x40001A4,
-            "REG_ROMCTRL",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "card bus timing/control (formerly romctrl)",
-        )
-        self._define_reg_with_tag(
-            0x40001A8,
-            "REG_CARDCMD",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "card command (8 bytes)",
-        )
-        self._define_reg_with_tag(
-            0x4100010,
-            "REG_CARDDATA",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "card data read fifo",
-        )
-        self._define_reg_with_tag(
-            0x40001B0,
-            "REG_CARD_SECKEY1_L",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "seed 0/key1 low",
-        )
-        self._define_reg_with_tag(
-            0x40001B4,
-            "REG_CARD_SECKEY2_L",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "seed 1/key2 low (if used)",
-        )
-        self._define_reg_with_tag(
-            0x40001B8,
-            "REG_CARD_SECKEY1_H",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "seed 0/key1 high (7 bits)",
-        )
-        self._define_reg_with_tag(
-            0x40001BA,
-            "REG_CARD_SECKEY2_H",
-            "Gamecard",
-            tag_types["Gamecard"],
-            "seed 1/key2 high (7 bits)",
-        )
-        self._define_reg_with_tag(
-            0x4000208,
-            "REG_IME",
-            "Interrupts",
-            tag_types["Interrupts"],
-            "interrupt master enable (0/1)",
-        )
-        self._define_reg_with_tag(
-            0x4000210,
-            "REG_IE",
-            "Interrupts",
-            tag_types["Interrupts"],
-            "interrupt enable bits",
-        )
-        self._define_reg_with_tag(
-            0x4000214,
-            "REG_IF",
-            "Interrupts",
-            tag_types["Interrupts"],
-            "interrupt request flags (write 1 to clear)",
-        )
-        self._define_reg_with_tag(
-            0x4000300,
-            "REG_POSTFLG",
-            "System",
-            tag_types["System"],
-            "boot flag? undocumented",
-        )
-        self._define_reg_with_tag(
-            0x4000301,
-            "REG_HALTCNT",
-            "Power",
-            tag_types["Power"],
-            "power down control (nds bits differ from gba)",
-        )
 
-        # --- arm9 specific i/o registers ---
-        tag_name_a9 = "ARM9 Specific"
-        tag_icon_a9 = tag_types[tag_name_a9]
-        self._define_reg_with_tag(
-            0x4000000,
-            "REG_DISPCNT_A",
-            "Display",
-            tag_types["Display"],
-            "display control (engine a)",
-        )  # Also tag with A9?
-        # ... (Define and tag all other Engine A registers similarly) ...
-        self._define_reg_with_tag(
-            0x400006C,
-            "REG_MASTER_BRIGHT_A",
-            "Display",
-            tag_types["Display"],
-            "master brightness (engine a)",
-        )
-        self._define_reg_with_tag(
-            0x4000204,
-            "REG_EXMEMCNT",
-            "Memory Control",
-            tag_types["Memory Control"],
-            "external memory control (gba slot, etc.)",
-        )
-        # ... (Define and tag VRAM/WRAM control regs) ...
-        self._define_reg_with_tag(
-            0x4000249,
-            "REG_VRAMCNT_I",
-            "Memory Control",
-            tag_types["Memory Control"],
-            "vram bank i control",
-        )
-        # ... (Define and tag Math regs) ...
-        self._define_reg_with_tag(
-            0x40002BC,
-            "REG_SQRT_PARAM_H",
-            "Math",
-            tag_types["Math"],
-            "square root param (high 32)",
-        )
-        self._define_reg_with_tag(
-            0x4000304,
-            "REG_POWCNT1",
-            "Power",
-            tag_types["Power"],
-            "graphics/system power control 1",
-        )
-        # Tag 3D Engine Region
-        tag_type_3d = self._get_or_create_tag_type("3D Engine", tag_types["3D Engine"])
-        if tag_type_3d:
-            self.add_tag(0x4000320, tag_type_3d, "NDS 3D Registers Start")
-            self.add_tag(0x40006A3, tag_type_3d, "NDS 3D Registers End")
-        # ... (Define and tag Engine B regs) ...
-        self._define_reg_with_tag(
-            0x400106C,
-            "REG_MASTER_BRIGHT_B",
-            "Display",
-            tag_types["Display"],
-            "master brightness (engine b)",
-        )
+    # --- main initialization logic ---
 
-        # --- arm7 specific i/o registers ---
-        tag_name_a7 = "ARM7 Specific"
-        tag_icon_a7 = tag_types[tag_name_a7]
-        self._define_reg_with_tag(
-            0x4000120,
-            "REG_SIODATA32",
-            "System",
-            tag_types["System"],
-            "sio data 32bit (normal/multiplayer)",
-        )
-        self._define_reg_with_tag(
-            0x4000128,
-            "REG_SIOCNT",
-            "System",
-            tag_types["System"],
-            "sio control (normal/multiplayer)",
-        )
-        self._define_reg_with_tag(
-            0x4000134,
-            "REG_RCNT",
-            "System",
-            tag_types["System"],
-            "sio mode select / general purpose io",
-        )
-        self._define_reg_with_tag(
-            0x4000138,
-            "REG_RTCDATA",
-            "RTC",
-            tag_types["RTC"],
-            "rtc data register (via spi)",
-        )
-        self._define_reg_with_tag(
-            0x40001C0, "REG_SPICNT", "SPI", tag_types["SPI"], "spi control"
-        )
-        self._define_reg_with_tag(
-            0x40001C2, "REG_SPIDATA", "SPI", tag_types["SPI"], "spi data"
-        )
-        self._define_reg_with_tag(
-            0x4000204,
-            "REG_EXMEMSTAT",
-            "Memory Control",
-            tag_types["Memory Control"],
-            "external memory status (read only)",
-        )
-        self._define_reg_with_tag(
-            0x4000240,
-            "REG_VRAMSTAT",
-            "Memory Control",
-            tag_types["Memory Control"],
-            "vram c,d bank status",
-        )
-        self._define_reg_with_tag(
-            0x4000241,
-            "REG_WRAMSTAT",
-            "Memory Control",
-            tag_types["Memory Control"],
-            "wram bank status",
-        )
-        self._define_reg_with_tag(
-            0x4000304,
-            "REG_POWCNT2",
-            "Power",
-            tag_types["Power"],
-            "sound/wifi power control 2",
-        )
-        self._define_reg_with_tag(
-            0x4000308,
-            "REG_BIOSPROT",
-            "System",
-            tag_types["System"],
-            "bios write protection",
-        )
-        # ... (Define and tag Sound regs) ...
-        self._define_reg_with_tag(
-            0x400051C, "REG_SNDCAP1LEN", "Sound", tag_types["Sound"], "capture 1 length"
-        )
-        # Tag Wifi Region
-        tag_type_wifi = self._get_or_create_tag_type("Wifi", tag_types["Wifi"])
-        if tag_type_wifi:
-            self.add_tag(0x4800000, tag_type_wifi, "NDS Wifi Region Start")
-            self.add_tag(0x480FFFF, tag_type_wifi, "NDS Wifi Region End")
+    def init(self) -> bool:
+        """
+        initializes the NDSView by parsing the header, mapping memory regions,
+        loading binaries, defining sections, symbols, and tags.
+        returns:
+            true on successful initialization, false otherwise.
+        """
+        # platform/arch should be valid here if __init__ succeeded.
 
-        # --- hardcoded ram addresses ---
-        tag_name_hc = "Hardcoded Addr"
-        tag_icon_hc = tag_types[tag_name_hc]
-        self._define_reg_with_tag(
-            0x0380FFF8,
-            "NDS7_IRQ_CHECKBITS",
-            tag_name_hc,
-            tag_icon_hc,
-            "arm7 irq 'if' check bits mirror?",
-        )
-        self._define_reg_with_tag(
-            0x0380FFFC,
-            "NDS7_IRQ_HANDLER_PTR",
-            tag_name_hc,
-            tag_icon_hc,
-            "arm7 pointer to irq handler",
-        )
-        self._define_reg_with_tag(
-            0x027FFFFE, "MAIN_MEM_CNT", tag_name_hc, tag_icon_hc, "main memory control?"
-        )
+        try:
+            self.log.log_info("starting nds rom loading process...")
 
-    # --- overridden methods ---
+            # --- main loading steps ---
+            if not self._parse_rom_header():
+                return False
+            self._define_tag_types()
+            self._map_memory_regions()
+            self._load_arm9()
+            self._load_arm7()
+            self._load_overlays(
+                "ARM9", self.nds_rom.arm9_overlay_table if self.nds_rom else None
+            )
+            self._load_overlays(
+                "ARM7", self.nds_rom.arm7_overlay_table if self.nds_rom else None
+            )
+            # load debug info if present (optional step)
+            # if self.nds_rom and self.nds_rom.header.debug_rom_offset != 0 and self.nds_rom.header.debug_size > 0:
+            #    self._init_debug_arm9() # Assuming this helper exists or is added
+            self._define_io_registers()
+            self._define_entry_points()
+
+            # --- final analysis update ---
+            self.log.log_info("nds rom loading complete. updating analysis...")
+            self.update_analysis_and_wait()
+            self.log.log_info("analysis update finished.")
+
+            return True  # initialization successful
+
+        except Exception as e:
+            # catch any unexpected errors during initialization
+            log_error(f"[NDS] failed to initialize ndsview: {e}")
+            log_error(traceback.format_exc())
+            return False  # indicate failure
+
+    # --- required binaryview methods ---
+
     def perform_is_executable(self) -> bool:
+        """nds roms contain executable code"""
         return True
 
     def perform_get_entry_point(self) -> int:
-        return self.nds_rom.header.arm9_entry_address if self.nds_rom else 0
+        """returns the primary (arm9) entry point address"""
+        # this is called by the core *after* init() completes.
+        if len(self.entry_points) > 0:
+            # prefer the first entry point added (usually arm9)
+            return self.entry_points[0]
+        elif self.nds_rom and self.nds_rom.header:
+            # fallback to header value if no entry points were added somehow
+            return self.nds_rom.header.arm9_entry_address
+        else:
+            # ultimate fallback
+            log_warn(
+                "[NDS] perform_get_entry_point called but no entry points defined and header not parsed. returning start address."
+            )
+            return self.start
 
     def perform_get_address_size(self) -> int:
+        """nds uses 32-bit addresses"""
         return 4
 
 
-# register the view type with binary ninja
 NDSView.register()
