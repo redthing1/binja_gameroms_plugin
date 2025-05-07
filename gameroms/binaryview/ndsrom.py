@@ -205,11 +205,11 @@ NDS_IO_REGISTERS: List[Tuple[int, str, str, str]] = [
     # 3d engine registers (0x4000320 - 0x40006a3) - define start/end tags
     (0x4000320, "NDS9_3D_REGS_START", "3D Engine", "NDS 3D Registers Start"),
     (
-        0x40006A3,
+        0x40006A3,  # gbatek lists up to 0x40006A3 (inclusive for last byte of a word)
         "NDS9_3D_REGS_END",
         "3D Engine",
         "NDS 3D Registers End",
-    ),  # gbatek doesn't specify end, using last known
+    ),
     # engine b registers
     (0x4001000, "REG_DISPCNT_B", "Display", "Display Control (Engine B)"),
     (0x4001008, "REG_BG0CNT_B", "Display", "BG0 Control (Engine B)"),
@@ -270,11 +270,11 @@ NDS_IO_REGISTERS: List[Tuple[int, str, str, str]] = [
     # sound registers (0x4000400 - 0x400051c) - define start/end tags
     (0x4000400, "NDS7_SOUND_REGS_START", "Sound", "NDS Sound Registers Start"),
     (
-        0x400051F,
+        0x400051F,  # last byte of last register (0x400051C + 3)
         "NDS7_SOUND_REGS_END",
         "Sound",
         "NDS Sound Registers End",
-    ),  # end is inclusive? using +1
+    ),
     (0x4000500, "REG_SOUNDCNT", "Sound", "Sound Control Register"),
     (0x4000504, "REG_SOUNDBIAS", "Sound", "Sound Bias Register"),
     (0x4000508, "REG_SNDCAP0CNT", "Sound", "Sound Capture 0 Control"),
@@ -286,11 +286,11 @@ NDS_IO_REGISTERS: List[Tuple[int, str, str, str]] = [
     # wifi registers (0x480xxxx) - define start/end tags
     (0x4800000, "NDS7_WIFI_REGS_START", "Wifi", "NDS Wifi Registers Start"),
     (
-        0x480FFFF,
+        0x480FFFF,  # end of the 0x480xxxx range
         "NDS7_WIFI_REGS_END",
         "Wifi",
         "NDS Wifi Registers End",
-    ),  # end is inclusive? using +1
+    ),
     # --- hardcoded ram addresses ---
     (
         0x0380FFF8,
@@ -305,9 +305,6 @@ NDS_IO_REGISTERS: List[Tuple[int, str, str, str]] = [
         "ARM7 Pointer to IRQ Handler",
     ),
     (0x027FFFFE, "MAIN_MEM_CNT", "Hardcoded Addr", "Main Memory Control?"),
-    # add dtcm addresses if dtcm base is known/fixed
-    # (0xdtcm_base + 0x3ff8, "nds9_irq_checkbits", "hardcoded addr", "arm9 irq check bits"),
-    # (0xdtcm_base + 0x3ffc, "nds9_irq_handler_ptr", "hardcoded addr", "arm9 irq handler"),
 ]
 
 # --- nitro sdk constants ---
@@ -357,7 +354,6 @@ class NDSView(BinaryView):
             # arm9 is armv5te, arm7 is armv4t.
             # use "armv7" as the closest available architecture in binary ninja
             # that supports both arm and thumb instructions needed for arm9 analysis.
-            # todo: potentially allow user choice or create separate views?
             self.arch: Architecture = Architecture["armv7"]  # type: ignore
             self.platform: Platform = self.arch.standalone_platform  # type: ignore
             if not self.platform:
@@ -369,12 +365,10 @@ class NDSView(BinaryView):
                 f"using platform: {self.platform.name}, architecture: {self.arch.name}"
             )
         except KeyError:
-            # log the available architectures to help debugging
-            available_archs = [arch.name for arch in Architecture]
+            available_archs = [arch.name for arch in Architecture]  # type: ignore
             log_error(
                 f"[NDS] critical: armv7 architecture not found. available: {available_archs}"
             )
-            # raise a more informative error
             raise RuntimeError(
                 f"required 'armv7' architecture not found in this binary ninja installation. available: {available_archs}"
             )
@@ -403,7 +397,6 @@ class NDSView(BinaryView):
                 log_info("[NDS] validation: found nintendo logo magic bytes.")
                 return True  # assume valid for now, full check in init()
             else:
-                # log_warn("[NDS] validation: nintendo logo magic bytes mismatch.") # can be noisy
                 return False
         except Exception as e:
             log_error(
@@ -419,7 +412,6 @@ class NDSView(BinaryView):
         performs full validation and stores the result in self.nds_rom.
         returns true on success, false on failure.
         """
-        # revert to reading full rom data for simplicity with existing ndsromreader.read
         self.log.log_info("reading entire rom into memory for header parsing...")
         rom_length = self.raw.length
         rom_data_bytes: bytes = self.raw.read(0, rom_length)
@@ -429,23 +421,25 @@ class NDSView(BinaryView):
             )
             return False
 
-        # --- perform full validation here ---
         self.log.log_info("performing full header validation...")
-        # use a larger chunk for validation if needed by is_valid
-        validation_size = min(0x1000, rom_length)  # e.g., first 4kb
+        validation_size = min(0x1000, rom_length)
         if not NDSRomReader.is_valid(rom_data_bytes[:validation_size]):
             self.log.log_error(
                 "full header validation failed via ndsromreader.is_valid."
             )
-            self.log.log_warn(
-                "continuing load despite header validation failure."
-            )  # or return false for strictness
+            # if strict validation is needed, uncomment the next line:
+            # return False
         else:
             self.log.log_info("full header validation successful.")
-        # ------------------------------------
 
         self.log.log_info("parsing nds rom structure using ndsromreader...")
-        self.nds_rom = NDSRomReader.read(rom_data_bytes)  # use original read method
+        try:
+            self.nds_rom = NDSRomReader.read(rom_data_bytes)
+        except Exception as e:
+            self.log.log_error(f"ndsromreader.read failed: {e}")
+            self.log.log_error(traceback.format_exc())
+            self.nds_rom = None  # ensure it's none on failure
+
         del rom_data_bytes  # free memory after parsing
 
         if not self.nds_rom or not self.nds_rom.header:
@@ -473,16 +467,13 @@ class NDSView(BinaryView):
         returns:
             the tagtype object or none if creation failed.
         """
-        # use lowercase for internal caching/lookup key
         name_lower = name.lower()
-        # check cache first.
         if name_lower in self._created_tag_types:
             return self._created_tag_types[name_lower]
 
-        # check if tag type already exists in the view.
         if name_lower in self.tag_types:
             tag_type = self.tag_types[name_lower]
-            if isinstance(tag_type, list):
+            if isinstance(tag_type, list):  # api can return list for some reason
                 tag_type = tag_type[0] if tag_type else None
             if tag_type:
                 self.log.log_info(f"found existing tagtype '{name_lower}'.")
@@ -492,14 +483,12 @@ class NDSView(BinaryView):
                 self.log.log_error(
                     f"tagtype '{name_lower}' exists but api returned empty list/none."
                 )
-                pass  # proceed to creation block.
+                # proceed to creation block.
 
-        # if not found or api returned none unexpectedly, create it.
         try:
-            # use the original (proper) casing for the name when creating.
             self.log.log_info(f"creating new tagtype '{name}' with icon '{icon}'.")
             tag_type = self.create_tag_type(name, icon)
-            self._created_tag_types[name_lower] = tag_type  # cache using lowercase key.
+            self._created_tag_types[name_lower] = tag_type
             return tag_type
         except Exception as e:
             self.log.log_error(f"failed to create tagtype '{name}': {e}")
@@ -508,120 +497,160 @@ class NDSView(BinaryView):
     def _define_reg_with_tag(
         self,
         address: int,
-        name: str,  # use proper case for symbol name
-        tag_type_name: str,  # use proper case for tag type name
+        name: str,
+        tag_type_name: str,
         tag_type_icon: str,
-        description: str = "",  # use proper case for description
+        description: str = "",
     ):
         """
         helper to define a hardware register symbol and apply a descriptive tag.
-        args:
-            address: the memory address of the register.
-            name: the name of the register (symbol name, e.g., "reg_dispstat").
-            tag_type_name: the name of the tag type to apply (e.g., "display").
-            tag_type_icon: the icon for the tag type (used if creating the type).
-            description: an optional comment for the register.
         """
         try:
-            # define the symbol at the specified address.
             self.define_auto_symbol(Symbol(SymbolType.DataSymbol, address, name))
-
-            # add the comment if provided.
             if description:
                 self.set_comment_at(address, description)
-
-            # get or create the tag type using the helper. pass proper case name.
             tag_type = self._get_or_create_tag_type(tag_type_name, tag_type_icon)
-
-            # add the tag to the address if the tag type was successfully obtained/created.
             if tag_type:
-                # use the register name as the tag data for easy identification in ui.
                 self.add_tag(address, tag_type, data=name)
         except Exception as e:
-            # log if defining symbol or adding tag fails, but don't stop the loading process.
             self.log.log_error(
                 f"failed processing register '{name}' at 0x{address:x}: {e}"
             )
 
     def _map_memory_regions(self):
-        """maps the core nds memory regions (ram, vram, io, etc.)."""
+        """maps the core nds memory regions (ram, vram, io, etc.).
+        ram regions that can contain code are given minimal file backing.
+        """
         self.log.log_info("mapping nds memory regions...")
 
-        # helper function to add segment and associated tag/comment.
         def add_memory_region(
-            addr, size, perms, name, tag_name="Memory Region", tag_icon="🗺️"
+            addr,
+            size,
+            perms,
+            name,
+            tag_name="Memory Region",
+            tag_icon="🗺️",
+            is_ram_for_code=False,
         ):
             self.log.log_info(f"  mapping {name}: addr=0x{addr:08x}, size=0x{size:x}")
-            # add the segment with zero offset/length from the file (it's ram or io).
-            self.add_auto_segment(addr, size, 0, 0, perms)
-            # get the tag type (use proper case name).
+
+            file_offset = 0
+            file_length = 0
+            if is_ram_for_code:
+                # provide minimal file backing for ram regions that might contain executable code
+                # to help with bndb saving of functions in these regions.
+                file_offset = 0  # can be any small, valid offset in the raw file
+                file_length = 1  # must be non-zero
+                if self.raw.length == 0:  # cannot back if raw file is empty
+                    self.log.log_warn(
+                        f"raw file length is 0, cannot provide file backing for RAM region {name}. mapping as non-backed."
+                    )
+                    file_length = 0
+                elif file_offset + file_length > self.raw.length:
+                    self.log.log_warn(
+                        f"minimal file backing for RAM region {name} (offset {file_offset}, len {file_length}) exceeds raw file length {self.raw.length}. mapping as non-backed."
+                    )
+                    file_length = 0
+
+            self.add_auto_segment(addr, size, file_offset, file_length, perms)
+
             tag_type = self._get_or_create_tag_type(tag_name, tag_icon)
             if tag_type:
-                # add tag at the start of the region.
                 self.add_tag(addr, tag_type, data=f"{name} Start")
-            # add comment at the start of the region (proper case allowed here).
-            self.set_comment_at(addr, f"{name} ({size // 1024}kb)")  # lowercase kb
+            self.set_comment_at(addr, f"{name} ({size // 1024}kb)")
 
-        # main ram
-        add_memory_region(0x02000000, 0x00400000, self.RWX_FLAGS, "Main RAM")
-        # shared wram
-        add_memory_region(0x03000000, 0x00008000, self.RWX_FLAGS, "Shared WRAM")
+        # main ram (4mb) - executable code (arm9, overlays) resides here
         add_memory_region(
-            0x037F8000, 0x00008000, self.RWX_FLAGS, "Shared WRAM Mirror"
-        )  # often used
-        # arm7 wram
-        add_memory_region(0x03800000, 0x00010000, self.RWX_FLAGS, "ARM7 WRAM")
-        # i/o registers
+            0x02000000, 0x00400000, self.RWX_FLAGS, "Main RAM", is_ram_for_code=True
+        )
+        # shared wram (32kb) - can contain code
+        add_memory_region(
+            0x03000000,
+            0x00008000,
+            self.RWX_FLAGS,
+            "Shared WRAM (Main)",
+            is_ram_for_code=True,
+        )
+        add_memory_region(
+            0x037F8000,
+            0x00008000,
+            self.RWX_FLAGS,
+            "Shared WRAM (ARM7 Mirror)",
+            is_ram_for_code=True,
+        )
+        # arm7 wram (64kb) - can contain arm7 code
+        add_memory_region(
+            0x03800000, 0x00010000, self.RWX_FLAGS, "ARM7 WRAM", is_ram_for_code=True
+        )
+
+        # i/o registers - not typically executable, no special backing needed
         add_memory_region(
             0x04000000,
-            0x00001000,  # cover up to 0x4000fff (includes engine b)
+            0x00001000,
             self.RW_FLAGS,
-            "I/O Registers",
+            "I/O Registers (Main Block)",
             tag_name="Hardware Register",
             tag_icon="🔩",
         )
-        # add specific ranges for clarity if needed, but one large block is simpler
-        # add_memory_region(0x04000000, 0x000001a0, self.rw_flags, "i/o (display/dma/timers/keypad)", tag_name="hardware register", tag_icon="🔩")
-        # add_memory_region(0x040001a0, 0x000000c0, self.rw_flags, "i/o (cart/ipc/spi)", tag_name="hardware register", tag_icon="🔩")
-        # add_memory_region(0x04000200, 0x00000100, self.rw_flags, "i/o (mem/irq/math)", tag_name="hardware register", tag_icon="🔩")
-        # add_memory_region(0x04000300, 0x00000100, self.rw_flags, "i/o (power/gfx/3d)", tag_name="hardware register", tag_icon="🔩")
-        # add_memory_region(0x04000400, 0x00000200, self.rw_flags, "i/o (sound)", tag_name="hardware register", tag_icon="🔩")
-        # add_memory_region(0x04001000, 0x00000100, self.rw_flags, "i/o (engine b)", tag_name="hardware register", tag_icon="🔩")
-
         add_memory_region(
             0x04100000,
-            0x00000020,  # cover up to 0x410001f
+            0x00000020,
             self.RW_FLAGS,
-            "IPC FIFO / Card Data",
+            "I/O Registers (IPC/Card Data)",
             tag_name="Hardware Register",
             tag_icon="🔩",
         )
-        # palette ram
         add_memory_region(
-            0x05000000, 0x00001000, self.RW_FLAGS, "Palette RAM"
-        )  # 2x 2kb
-        # vram (treat as one large block, specific banks handled by vramcnt regs)
-        add_memory_region(0x06000000, 0x000A4000, self.RW_FLAGS, "VRAM")  # total 656kb
-        add_memory_region(0x06800000, 0x000A4000, self.RW_FLAGS, "VRAM LCDC Mirror")
-        # oam
-        add_memory_region(0x07000000, 0x00001000, self.RW_FLAGS, "OAM")  # 2x 2kb
-        # arm9 bios
-        add_memory_region(0xFFFF0000, 0x00004000, self.RX_FLAGS, "ARM9 BIOS")
-        # arm7 bios is typically at 0x00000000, but that's handled by arm7 loading if a separate view is created
+            0x04800000,
+            0x00010000,
+            self.RW_FLAGS,
+            "I/O Registers (Wifi Block)",
+            tag_name="Wifi",
+            tag_icon="📡",
+        )
 
-        # itcm (instruction tightly coupled memory) - always at 0x01000000 for arm9? seems fixed.
-        add_memory_region(0x01000000, 0x00008000, self.RWX_FLAGS, "ARM9 ITCM (32KB)")
-        # dtcm (data tightly coupled memory) - base address configurable? default often 0x027c0000 or similar?
-        # need to determine dtcm base if possible, maybe from moduleparams or common usage.
-        # for now, let's add a placeholder or omit it until we have a reliable base.
-        # example: add_memory_region(0x027c0000, 0x00004000, self.rwx_flags, "arm9 dtcm (16kb)")
+        # palette, vram, oam - not typically executable
+        add_memory_region(0x05000000, 0x00001000, self.RW_FLAGS, "Palette RAM")
+        add_memory_region(0x06000000, 0x000A4000, self.RW_FLAGS, "VRAM (Main Banks)")
+        add_memory_region(0x06800000, 0x000A4000, self.RW_FLAGS, "VRAM (LCDC Mapped)")
+        add_memory_region(0x07000000, 0x00001000, self.RW_FLAGS, "OAM")
+
+        # bios regions - are rom, but if we don't have their actual bytes, providing minimal backing might help if functions are defined.
+        # however, bios code is usually not "added" by the loader, it's inherent.
+        # for now, treat as potentially containing executable code that might need "backing" for BNDB.
+        add_memory_region(
+            0xFFFF0000, 0x00004000, self.RX_FLAGS, "ARM9 BIOS", is_ram_for_code=True
+        )  # if functions defined here
+        add_memory_region(
+            0x00000000,
+            0x00004000,
+            self.RX_FLAGS,
+            "ARM7 BIOS (Physical 0x0)",
+            is_ram_for_code=True,
+        )  # if functions defined here
+
+        # arm9 itcm - definitely can contain executable code
+        add_memory_region(
+            0x01000000,
+            0x00008000,
+            self.RWX_FLAGS,
+            "ARM9 ITCM (32KB)",
+            is_ram_for_code=True,
+        )
+        # arm9 dtcm - less likely for code, but possible. treat as ram.
+        add_memory_region(
+            0x027C0000,
+            0x00004000,
+            self.RWX_FLAGS,
+            "ARM9 DTCM (16KB, Common Default)",
+            is_ram_for_code=True,
+        )
 
     def _find_module_params(self, data: bytes) -> Optional[int]:
         """searches for the nitro sdk _start_moduleparams magic bytes."""
         try:
             magic_index = data.find(NITRO_SDK_MODULE_PARAMS_MAGIC)
             if magic_index != -1:
-                # calculate the start of the struct based on magic offset
                 struct_start_offset = magic_index - NITRO_SDK_MODULE_PARAMS_MAGIC_OFFSET
                 if (
                     struct_start_offset >= 0
@@ -639,13 +668,12 @@ class NDSView(BinaryView):
                 self.log.log_info(
                     "_start_moduleparams magic not found. assuming non-sdk build or different structure."
                 )
-
         except Exception as e:
             self.log.log_error(f"error searching for moduleparams: {e}")
         return None
 
     def _load_arm9(self):
-        """loads the main arm9 binary, handling decompression based on nitro sdk structures if found."""
+        """loads the main arm9 binary, handling decompression and bss."""
         if not self.nds_rom or not self.nds_rom.header:
             self.log.log_error("cannot load arm9, rom header not parsed.")
             return
@@ -663,158 +691,190 @@ class NDSView(BinaryView):
             )
             return
 
-        # --- initialize variables ---
-        final_arm9_data = arm9_data_raw
         load_address = header.arm9_ram_address
-        code_data_size = header.arm9_size  # default to raw size from header
-        bss_start_address = 0  # default assuming bss follows code/data
-        bss_size = header.arm9_bss_size  # rely on value parsed by nds_cartridge.py
-        is_compressed = False
+        # effective_code_data_size is the size of the code/data segment in memory after any transformation
+        effective_code_data_size = 0
+        bss_size = header.arm9_bss_size
+
+        is_compressed_according_to_moduleparams = False
         module_params_found = False
-        sdk_code_data_size = 0
+        sdk_derived_code_data_size = (
+            0  # expected decompressed size if moduleparams are used
+        )
 
-        # --- try to find _start_moduleparams to determine compression and potential code size ---
-        module_params_offset = self._find_module_params(arm9_data_raw)
+        module_params_offset_in_raw = self._find_module_params(arm9_data_raw)
 
-        if module_params_offset is not None:
+        if module_params_offset_in_raw is not None:
             module_params_found = True
             try:
-                # unpack fields relative to the start of the raw data block
-                # offsets: 2=autoloadstart, 5=compressedstaticend
                 auto_load_start = struct.unpack_from(
-                    "<I", arm9_data_raw, module_params_offset + 8
+                    "<I", arm9_data_raw, module_params_offset_in_raw + 8
                 )[0]
                 compressed_static_end = struct.unpack_from(
-                    "<I", arm9_data_raw, module_params_offset + 20
+                    "<I", arm9_data_raw, module_params_offset_in_raw + 20
                 )[0]
-
-                # determine compression status
-                is_compressed = compressed_static_end != 0
-                # calculate expected code/data size based on moduleparams
-                sdk_code_data_size = auto_load_start - load_address
+                is_compressed_according_to_moduleparams = compressed_static_end != 0
+                sdk_derived_code_data_size = auto_load_start - load_address
 
                 self.log.log_info(
-                    f"  moduleparams: compressed={is_compressed}, codedataend=0x{auto_load_start:x}"
+                    f"  moduleparams: compressed={is_compressed_according_to_moduleparams}, autoload_end=0x{auto_load_start:x}, sdk_code_data_size=0x{sdk_derived_code_data_size:x}"
                 )
-
-                if sdk_code_data_size < 0:
+                if not (
+                    0 <= sdk_derived_code_data_size <= header.arm9_size * 20
+                ):  # sanity check (allow reasonable compression ratio)
                     self.log.log_error(
-                        f"  moduleparams: invalid code/data size calculation (load=0x{load_address:x}, end=0x{auto_load_start:x}). using raw size from header."
+                        f"  moduleparams: invalid sdk_code_data_size (0x{sdk_derived_code_data_size:x}). will use header.arm9_size."
                     )
-                    sdk_code_data_size = header.arm9_size  # fallback
-                    is_compressed = (
-                        False  # assume uncompressed if size calculation failed
-                    )
-                else:
-                    # use sdk-derived size if valid
-                    code_data_size = sdk_code_data_size
-
-            except struct.error as e:
-                self.log.log_error(
-                    f"failed to unpack _start_moduleparams structure: {e}. using header size."
-                )
-                module_params_found = False  # treat as not found if unpacking fails
+                    sdk_derived_code_data_size = header.arm9_size
+                    is_compressed_according_to_moduleparams = False  # be cautious
             except Exception as e:
                 self.log.log_error(
-                    f"unexpected error processing _start_moduleparams: {e}. using header size."
+                    f"error processing _start_moduleparams: {e}. using header.arm9_size."
                 )
-                module_params_found = False  # treat as not found on other errors
-
-        # --- decompress if necessary ---
-        if is_compressed:
+                module_params_found = False
+                sdk_derived_code_data_size = header.arm9_size
+                is_compressed_according_to_moduleparams = False
+        else:  # moduleparams not found
+            sdk_derived_code_data_size = (
+                header.arm9_size
+            )  # default to raw size from header
+            is_compressed_according_to_moduleparams = False  # assume uncompressed
             self.log.log_info(
-                f"  decompressing arm9 (expected decompressed size: 0x{code_data_size:x})..."
+                "  _start_moduleparams not found. assuming arm9 is uncompressed or using header size."
+            )
+
+        arm9_was_actually_decompressed_and_valid = False
+
+        if is_compressed_according_to_moduleparams:
+            self.log.log_info(
+                f"  attempting arm9 decompression (expected decompressed size: 0x{sdk_derived_code_data_size:x})..."
             )
             try:
                 decompressed_data = self._mii_uncompress_backward(arm9_data_raw)
-                if len(decompressed_data) != code_data_size:
-                    self.log.log_warn(
-                        f"  decompressed arm9 size (0x{len(decompressed_data):x}) does not match moduleparams expected size (0x{code_data_size:x}). using actual decompressed size."
+                if decompressed_data:  # check if decompression yielded any data
+                    actual_decompressed_size = len(decompressed_data)
+                    if (
+                        module_params_found
+                        and actual_decompressed_size != sdk_derived_code_data_size
+                    ):
+                        self.log.log_warn(
+                            f"  actual decompressed arm9 size (0x{actual_decompressed_size:x}) != moduleparams expected (0x{sdk_derived_code_data_size:x}). using actual."
+                        )
+
+                    effective_code_data_size = actual_decompressed_size
+
+                    # segment definition points to original compressed data in the file,
+                    # but its memory size is the decompressed size.
+                    self.log.log_info(
+                        f"  adding segment for decompressed arm9: mem_addr=0x{load_address:08x}, mem_size=0x{effective_code_data_size:x}, file_offset=0x{header.arm9_rom_offset:x}, file_size=0x{header.arm9_size:x}"
                     )
-                    code_data_size = len(decompressed_data)  # use the actual size
-                final_arm9_data = decompressed_data
-                self.log.log_info(
-                    f"  decompression successful: {header.arm9_size} bytes -> {code_data_size} bytes"
-                )
+                    self.add_auto_segment(
+                        load_address,
+                        effective_code_data_size,  # memory address and size (decompressed)
+                        header.arm9_rom_offset,
+                        header.arm9_size,  # file offset and size (original compressed)
+                        self.RX_FLAGS,
+                    )
+
+                    self.log.log_info(
+                        f"  writing {effective_code_data_size} bytes of decompressed arm9 data to 0x{load_address:08x}"
+                    )
+                    bytes_written = self.write(load_address, decompressed_data)
+                    if bytes_written != effective_code_data_size:
+                        self.log.log_error(
+                            f"arm9 write error (decompressed): expected {effective_code_data_size}, wrote {bytes_written}. segment may be corrupt."
+                        )
+                        # proceed with caution, segment might be partially written or incorrect
+                    else:
+                        arm9_was_actually_decompressed_and_valid = (
+                            True  # successfully decompressed and written
+                        )
+                else:
+                    self.log.log_warn(
+                        "arm9 decompression resulted in empty data. falling back to raw mapping."
+                    )
             except Exception as e:
                 self.log.log_error(
-                    f"arm9 decompression failed: {e}. loading raw data instead."
+                    f"arm9 decompression raised an exception: {e}. falling back to raw mapping."
                 )
-                is_compressed = False  # revert flag
-                final_arm9_data = arm9_data_raw
-                code_data_size = header.arm9_size  # revert size
-                bss_size = 0  # cannot trust bss info if decompression failed
-        elif module_params_found:
-            # verify raw size matches expected sdk size if moduleparams found but not compressed
-            if header.arm9_size != code_data_size:
-                self.log.log_warn(
-                    f"  arm9 raw size (0x{header.arm9_size:x}) does not match moduleparams expected size (0x{code_data_size:x}) for uncompressed data. using derived size."
-                )
-                # code_data_size is already set to sdk_code_data_size
-            else:
-                self.log.log_info("  arm9 is uncompressed (verified by moduleparams).")
-        else:
-            # moduleparams not found, assume uncompressed
-            self.log.log_info(
-                "  assuming arm9 is uncompressed (no moduleparams found)."
-            )
-            code_data_size = header.arm9_size  # use raw size from header
 
-        # --- add segment and load data ---
-        if code_data_size > 0:
-            if is_compressed:
-                # if decompressed, size changed, so add segment then write
-                self.add_auto_segment(
-                    load_address, code_data_size, 0, code_data_size, self.RX_FLAGS
+        # if not compressed, or if decompression was attempted but failed or yielded empty data
+        if not arm9_was_actually_decompressed_and_valid:
+            if (
+                is_compressed_according_to_moduleparams
+            ):  # implies decompression failed or was empty
+                self.log.log_warn(
+                    "  falling back to mapping raw arm9 data due to decompression issue."
                 )
-                bytes_written = self.write(load_address, final_arm9_data)
-                if bytes_written != code_data_size:
-                    self.log.log_error(
-                        f"arm9 write error (decompressed): expected {code_data_size}, wrote {bytes_written}"
+            else:  # was not considered compressed in the first place
+                self.log.log_info("  arm9 mapping as raw/uncompressed data.")
+
+            effective_code_data_size = header.arm9_size  # default to size in rom header
+            file_map_length = header.arm9_size
+
+            if (
+                module_params_found
+                and not is_compressed_according_to_moduleparams
+                and sdk_derived_code_data_size > 0
+            ):
+                if sdk_derived_code_data_size != header.arm9_size:
+                    self.log.log_warn(
+                        f"  moduleparams size 0x{sdk_derived_code_data_size:x} for uncompressed ARM9 differs from header size 0x{header.arm9_size:x}. Using moduleparams size for segment memory."
                     )
-                    return  # fail if write fails
-            else:
-                # if not decompressed, map directly from file up to code_data_size
-                # ensure we don't map more than the original header.arm9_size from the file
-                file_map_length = min(code_data_size, header.arm9_size)
+                effective_code_data_size = sdk_derived_code_data_size  # memory size
+                file_map_length = min(
+                    sdk_derived_code_data_size, header.arm9_size
+                )  # but map from file based on smaller of the two
+
+            if effective_code_data_size > 0:
+                self.log.log_info(
+                    f"  adding segment for raw arm9: mem_addr=0x{load_address:08x}, mem_size=0x{effective_code_data_size:x}, file_offset=0x{header.arm9_rom_offset:x}, file_size=0x{file_map_length:x}"
+                )
                 self.add_auto_segment(
                     load_address,
-                    code_data_size,  # segment length in memory
-                    header.arm9_rom_offset,  # file offset
-                    file_map_length,  # length in file
+                    effective_code_data_size,
+                    header.arm9_rom_offset,
+                    file_map_length,
                     self.RX_FLAGS,
                 )
+            else:
+                self.log.log_error(
+                    "  arm9 effective_code_data_size is 0 for raw mapping. cannot create segment."
+                )
+                return
 
-            # add section for analysis
+        # add section for analysis
+        if effective_code_data_size > 0:
             self.add_auto_section(
-                name=".arm9_code_data",  # more specific name
+                name=".arm9_code_data",
                 start=load_address,
-                length=code_data_size,
+                length=effective_code_data_size,
                 semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,
                 type="Code",
             )
-            self.set_comment_at(
-                load_address,
-                f"arm9 code/data start{' (decompressed)' if is_compressed else ''}{' (sdk)' if module_params_found else ''}",
-            )
+            comment = "arm9 code/data start"
+            if arm9_was_actually_decompressed_and_valid:
+                comment += " (decompressed)"
+            elif module_params_found and not is_compressed_according_to_moduleparams:
+                comment += " (sdk raw)"
+            elif is_compressed_according_to_moduleparams:
+                comment += " (raw, decompression failed/empty)"  # if it was supposed to be compressed but ended up raw
+            else:
+                comment += " (raw)"
+            self.set_comment_at(load_address, comment)
         else:
-            self.log.log_warn("arm9 code/data size is zero, skipping segment creation.")
-
-        # --- handle arm9 bss ---
-        # use the bss size parsed by nds_cartridge.py (which checks moduleparams)
-        if bss_size > 0:
-            # assume bss follows code/data section unless moduleparams gave specific start
-            # (note: nds_cartridge doesn't store the start addr, only the size)
-            bss_start_address = load_address + code_data_size
-
-            self.log.log_info(
-                f"  mapping arm9 bss (from header/moduleparams): addr=0x{bss_start_address:08x}, size=0x{bss_size:x}"
+            self.log.log_warn(
+                "arm9 effective code/data size is zero, skipping section creation."
             )
-            # no overlap check needed here since we assume it follows
+            return
 
-            self.add_auto_segment(
-                bss_start_address, bss_size, 0, 0, self.RW_FLAGS
-            )  # bss is rw, not executable
+        # handle arm9 bss
+        if bss_size > 0:
+            bss_start_address = load_address + effective_code_data_size
+            self.log.log_info(
+                f"  mapping arm9 bss: addr=0x{bss_start_address:08x}, size=0x{bss_size:x}"
+            )
+            self.add_auto_segment(bss_start_address, bss_size, 0, 0, self.RW_FLAGS)
             self.add_auto_section(
                 name=".arm9.bss",
                 start=bss_start_address,
@@ -823,19 +883,16 @@ class NDSView(BinaryView):
                 type="BSS",
             )
             self.set_comment_at(bss_start_address, "arm9 bss start")
-            # ensure bss is marked non-executable
-            # self.set_auto_segment_execute(bss_start_address, bss_size, false) # bn api might not have this exact function
         else:
-            self.log.log_info("  no arm9 bss section defined or found.")
+            self.log.log_info("  no arm9 bss section defined.")
 
         self.log.log_info(
             f"arm9 loaded: entry=0x{header.arm9_entry_address:08x}, load=0x{load_address:08x}, "
-            f"code_data_size=0x{code_data_size:x}, bss_size=0x{bss_size:x}, offset=0x{header.arm9_rom_offset:08x} "
-            f"{'(sdk decompressed)' if is_compressed else ('(sdk raw)' if module_params_found else '(no sdk/raw)')}"
+            f"code_data_size=0x{effective_code_data_size:x}, bss_size=0x{bss_size:x}, rom_offset=0x{header.arm9_rom_offset:08x}"
         )
 
     def _load_arm7(self):
-        """loads the main arm7 binary and adds section. arm7 is typically not compressed and doesn't use moduleparams."""
+        """loads the main arm7 binary and adds section. arm7 is typically not compressed."""
         if not self.nds_rom or not self.nds_rom.header:
             self.log.log_error("cannot load arm7, rom header not parsed.")
             return
@@ -846,32 +903,24 @@ class NDSView(BinaryView):
             return
 
         self.log.log_info("loading arm7 binary...")
-        # arm7 is usually not compressed, map directly from file
         load_address = header.arm7_ram_address
-        final_size = header.arm7_size  # use size from header
+        final_size = header.arm7_size
         self.add_auto_segment(
             load_address, final_size, header.arm7_rom_offset, final_size, self.RX_FLAGS
         )
 
-        # add section for analysis
         self.add_auto_section(
-            name=".arm7",  # simple name for the main binary
+            name=".arm7",
             start=load_address,
             length=final_size,
             semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,
             type="Code",
         )
-
         self.set_comment_at(load_address, "arm7 binary start")
-        self.log.log_info(
-            f"arm7 loaded: entry=0x{header.arm7_entry_address:08x}, load=0x{load_address:08x}, "
-            f"size=0x{final_size:x}, offset=0x{header.arm7_rom_offset:08x} (raw mapped)"
-        )
 
-        # handle arm7 bss (less common, rely on header field populated by nds_cartridge)
         arm7_bss_size = header.arm7_bss_size
         if arm7_bss_size > 0:
-            bss_start = load_address + final_size  # assume bss follows code
+            bss_start = load_address + final_size
             self.log.log_info(
                 f"  mapping arm7 bss: addr=0x{bss_start:08x}, size=0x{arm7_bss_size:x}"
             )
@@ -884,22 +933,29 @@ class NDSView(BinaryView):
                 type="BSS",
             )
             self.set_comment_at(bss_start, "arm7 bss start")
-            # self.set_auto_segment_execute(bss_start, arm7_bss_size, false) # mark non-executable
+
+        self.log.log_info(
+            f"arm7 loaded: entry=0x{header.arm7_entry_address:08x}, load=0x{load_address:08x}, "
+            f"size=0x{final_size:x}, bss_size=0x{arm7_bss_size:x}, rom_offset=0x{header.arm7_rom_offset:08x} (raw mapped)"
+        )
 
     def _load_overlays(self, cpu_name: str, overlay_table: Optional[NDSOverlayTable]):
         """
-        loads arm9 or arm7 overlays, handling decompression based on flags and adding segments/sections.
-        args:
-            cpu_name: "arm9" or "arm7" for logging/naming.
-            overlay_table: the parsed ndsoverlaytable object.
+        loads arm9 or arm7 overlays, handling decompression and adding segments/sections.
         """
-        if not self.nds_rom or not overlay_table or not overlay_table.entries:
-            self.log.log_info(f"no {cpu_name} overlays found or overlay table missing.")
+        if (
+            not self.nds_rom
+            or not self.nds_rom.fat_entries
+            or not overlay_table
+            or not overlay_table.entries
+        ):
+            self.log.log_info(
+                f"no {cpu_name} overlays found, fat missing, or overlay table missing."
+            )
             return
-        # check if ndsoverlayentry has the is_compressed attribute
         if not hasattr(NDSOverlayEntry, "is_compressed"):
             self.log.log_error(
-                f"ndsoverlayentry in nds_cartridge.py is missing 'is_compressed' attribute. cannot load {cpu_name} overlays correctly."
+                f"nds_cartridge.py NDSOverlayEntry is missing 'is_compressed' attribute. cannot load {cpu_name} overlays correctly."
             )
             return
 
@@ -907,187 +963,193 @@ class NDSView(BinaryView):
         num_loaded = 0
         num_failed = 0
         for i, entry in enumerate(overlay_table.entries):
-            # --- basic validation ---
             if entry.file_id == 0xFFFF:
-                self.log.log_info(
-                    f"skipping {cpu_name} overlay {i} (file id 0xffff - placeholder)."
-                )
-                continue  # skip placeholder entries silently
+                continue
             if entry.file_id >= len(self.nds_rom.fat_entries):
                 self.log.log_warn(
-                    f"skipping invalid {cpu_name} overlay {i}: file id {entry.file_id} out of fat bounds ({len(self.nds_rom.fat_entries)} entries)."
+                    f"skipping invalid {cpu_name} overlay {i}: file id {entry.file_id} out of fat bounds."
                 )
                 num_failed += 1
                 continue
             if entry.ram_size == 0 and entry.bss_size == 0:
                 self.log.log_info(
-                    f"skipping empty {cpu_name} overlay {i} (file id {entry.file_id}): zero ram and bss size."
+                    f"skipping empty {cpu_name} overlay {i} (file id {entry.file_id})."
                 )
-                continue  # skip empty overlays silently
+                continue
 
             fat_entry = self.nds_rom.fat_entries[entry.file_id]
-            if fat_entry.start_address >= fat_entry.end_address:
-                self.log.log_warn(
-                    f"skipping invalid {cpu_name} overlay {i} (file id {entry.file_id}): fat entry invalid (start >= end)."
-                )
-                num_failed += 1
-                continue
-
             overlay_size_in_rom = fat_entry.end_address - fat_entry.start_address
-            if overlay_size_in_rom <= 0:
+
+            overlay_data_raw = b""
+            if overlay_size_in_rom > 0:
+                overlay_data_raw = self.raw.read(
+                    fat_entry.start_address, overlay_size_in_rom
+                )
+                if not overlay_data_raw or len(overlay_data_raw) != overlay_size_in_rom:
+                    self.log.log_error(
+                        f"failed to read {cpu_name} overlay {i} (file id {entry.file_id}) data."
+                    )
+                    num_failed += 1
+                    continue
+            elif entry.ram_size > 0:
                 self.log.log_warn(
-                    f"skipping invalid {cpu_name} overlay {i} (file id {entry.file_id}): non-positive size in rom (0x{overlay_size_in_rom:x})."
+                    f"{cpu_name} overlay {i} expects RAM content (size 0x{entry.ram_size:x}) but has no data in ROM. Skipping code/data part."
                 )
-                num_failed += 1
-                continue
 
-            # --- read overlay data ---
-            overlay_data_raw: bytes = self.raw.read(
-                fat_entry.start_address, overlay_size_in_rom
-            )
-            if not overlay_data_raw or len(overlay_data_raw) != overlay_size_in_rom:
-                self.log.log_error(
-                    f"failed to read {cpu_name} overlay {i} (file id {entry.file_id}) data from rom offset 0x{fat_entry.start_address:x} (read {len(overlay_data_raw)}, expected {overlay_size_in_rom})"
-                )
-                num_failed += 1
-                continue
-
-            # --- prepare for loading ---
-            loaded_data = b""
-            segment_ram_size = 0  # size of the code/data part loaded into ram
+            segment_ram_size_in_memory = 0  # actual size of code/data part in memory
             load_address = entry.ram_address
             segment_name_base = f"{cpu_name}_Overlay_{i}_File{entry.file_id}"
-            decompressed_successfully = False
+            overlay_was_decompressed_and_valid = False
 
-            # --- handle decompression based on flag ---
             if entry.is_compressed:
+                if not overlay_data_raw:
+                    self.log.log_error(
+                        f"cannot decompress {segment_name_base}: no raw data from rom."
+                    )
+                    num_failed += 1
+                    continue
+
                 self.log.log_info(
-                    f"  decompressing {segment_name_base} (expected ram size: 0x{entry.ram_size:x})..."
+                    f"  decompressing {segment_name_base} (rom size: 0x{overlay_size_in_rom:x}, expected ram size: 0x{entry.ram_size:x})..."
                 )
                 try:
                     decompressed_data = self._mii_uncompress_backward(overlay_data_raw)
-                    # use actual decompressed size for the segment
-                    segment_ram_size = len(decompressed_data)
-                    loaded_data = decompressed_data
-                    decompressed_successfully = True
-                    if segment_ram_size != entry.ram_size:
-                        self.log.log_warn(
-                            f"  {segment_name_base}: decompressed size (0x{segment_ram_size:x}) != expected ram size (0x{entry.ram_size:x}). using actual size."
+                    if decompressed_data:
+                        segment_ram_size_in_memory = len(decompressed_data)
+                        if (
+                            segment_ram_size_in_memory != entry.ram_size
+                            and entry.ram_size != 0
+                        ):
+                            self.log.log_warn(
+                                f"  {segment_name_base}: actual decompressed size (0x{segment_ram_size_in_memory:x}) != table RAM size (0x{entry.ram_size:x}). using actual."
+                            )
+
+                        # segment definition points to original compressed data, memory size is decompressed size
+                        self.log.log_info(
+                            f"  adding segment for decompressed overlay {segment_name_base}: mem_addr=0x{load_address:08x}, mem_size=0x{segment_ram_size_in_memory:x}, file_offset=0x{fat_entry.start_address:x}, file_size=0x{overlay_size_in_rom:x}"
                         )
-                    self.log.log_info(
-                        f"  decompression successful: {overlay_size_in_rom} bytes -> {segment_ram_size} bytes"
-                    )
+                        self.add_auto_segment(
+                            load_address,
+                            segment_ram_size_in_memory,  # memory address and size (decompressed)
+                            fat_entry.start_address,
+                            overlay_size_in_rom,  # file offset and size (original compressed)
+                            self.RX_FLAGS,
+                        )
+                        bytes_written = self.write(load_address, decompressed_data)
+                        if bytes_written != segment_ram_size_in_memory:
+                            self.log.log_error(
+                                f"overlay {segment_name_base} write error (decompressed): expected {segment_ram_size_in_memory}, wrote {bytes_written}"
+                            )
+                            # segment might be corrupted, do not mark as valid decompressed
+                        else:
+                            overlay_was_decompressed_and_valid = True
+                            self.log.log_info(
+                                f"  decompression & write successful: {overlay_size_in_rom} bytes -> {segment_ram_size_in_memory} bytes"
+                            )
+                    else:
+                        self.log.log_warn(
+                            f"  decompression of {segment_name_base} resulted in empty data."
+                        )
                 except Exception as e:
                     self.log.log_error(
-                        f"failed to decompress {segment_name_base}: {e}. skipping overlay."
+                        f"failed to decompress {segment_name_base}: {e}."
                     )
-                    num_failed += 1
-                    continue  # skip this overlay if decompression fails
-            else:
-                # not compressed, use raw data. segment size matches size in rom.
-                self.log.log_info(
-                    f"  loading {segment_name_base} (uncompressed, size: 0x{overlay_size_in_rom:x})."
-                )
-                loaded_data = overlay_data_raw
-                segment_ram_size = len(loaded_data)  # size is the raw size
-                # verify against ram_size from overlay table if needed
-                if segment_ram_size != entry.ram_size and entry.ram_size != 0:
+
+            # if not compressed, or if decompression failed/was empty
+            if not overlay_was_decompressed_and_valid:
+                if entry.is_compressed:  # implies decompression failed or was empty
                     self.log.log_warn(
-                        f"  {segment_name_base}: raw size (0x{segment_ram_size:x}) != expected ram size (0x{entry.ram_size:x}) for uncompressed overlay."
+                        f"  falling back to mapping raw overlay data for {segment_name_base} due to decompression issue."
                     )
-                    # decide whether to trust raw size or ram_size. let's trust raw size.
-
-            # --- add code/data segment ---
-            if segment_ram_size > 0:
-                if entry.is_compressed:
-                    # add segment and write decompressed data
+                # for uncompressed, or fallback:
+                segment_ram_size_in_memory = overlay_size_in_rom  # use raw size
+                if (
+                    segment_ram_size_in_memory > 0
+                ):  # only map if there's actual data in rom
+                    self.log.log_info(
+                        f"  adding segment for raw overlay {segment_name_base}: mem_addr=0x{load_address:08x}, size=0x{segment_ram_size_in_memory:x}, file_offset=0x{fat_entry.start_address:x}"
+                    )
                     self.add_auto_segment(
                         load_address,
-                        segment_ram_size,
-                        0,
-                        segment_ram_size,
+                        segment_ram_size_in_memory,
+                        fat_entry.start_address,
+                        segment_ram_size_in_memory,
                         self.RX_FLAGS,
                     )
-                    bytes_written = self.write(load_address, loaded_data)
-                    if bytes_written != segment_ram_size:
-                        self.log.log_error(
-                            f"overlay {segment_name_base} write error: expected {segment_ram_size}, wrote {bytes_written}"
-                        )
-                        num_failed += 1
-                        continue  # fail if write fails
-                else:
-                    # add segment mapping directly from file
-                    self.add_auto_segment(
-                        load_address,
-                        segment_ram_size,
-                        fat_entry.start_address,  # file offset
-                        segment_ram_size,  # length in file
-                        self.RX_FLAGS,
+                elif (
+                    entry.ram_size > 0
+                ):  # expected ram but no rom data and not decompressed
+                    self.log.log_warn(
+                        f"  {segment_name_base} expected RAM size 0x{entry.ram_size:x} but no data was mapped (raw or decompressed)."
                     )
 
-                # add section for the loaded code/data part
+            # add section for the code/data part
+            if segment_ram_size_in_memory > 0:
                 self.add_auto_section(
-                    name=f".{segment_name_base}",
-                    start=load_address,
-                    length=segment_ram_size,
-                    semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,  # assume code
-                    type="OverlayCode",
+                    f".{segment_name_base}",
+                    load_address,
+                    segment_ram_size_in_memory,
+                    SectionSemantics.ReadOnlyCodeSectionSemantics,
+                    "OverlayCode",
                 )
                 self.set_comment_at(
                     load_address,
-                    f"{segment_name_base} start{' (decompressed)' if entry.is_compressed else ' (raw)'}",
+                    f"{segment_name_base} start{' (decompressed)' if overlay_was_decompressed_and_valid else ' (raw)'}",
                 )
-            else:
-                # if ram_size is 0, but bss_size > 0, still need the base address for bss calculation
-                self.log.log_info(
-                    f"  {segment_name_base} has no code/data (ram size = 0)."
+            elif (
+                entry.ram_size > 0
+            ):  # expected ram content but segment_ram_size_in_memory is 0
+                self.log.log_warn(
+                    f"  {segment_name_base} expected RAM size 0x{entry.ram_size:x} but no valid data was loaded/decompressed for sectioning."
                 )
 
-            # --- add bss segment ---
+            # add bss segment
             if entry.bss_size > 0:
-                # bss starts immediately after the code/data segment in ram
-                bss_start_address = load_address + segment_ram_size
+                bss_start_address = load_address + segment_ram_size_in_memory
                 self.log.log_info(
                     f"  mapping {segment_name_base} bss: addr=0x{bss_start_address:08x}, size=0x{entry.bss_size:x}"
                 )
                 self.add_auto_segment(
-                    bss_start_address, entry.bss_size, 0, 0, self.RW_FLAGS  # bss is rw
+                    bss_start_address, entry.bss_size, 0, 0, self.RW_FLAGS
                 )
-                # add section for bss
                 self.add_auto_section(
-                    name=f".{segment_name_base}.bss",
-                    start=bss_start_address,
-                    length=entry.bss_size,
-                    semantics=SectionSemantics.ReadWriteDataSectionSemantics,
-                    type="OverlayBSS",
+                    f".{segment_name_base}.bss",
+                    bss_start_address,
+                    entry.bss_size,
+                    SectionSemantics.ReadWriteDataSectionSemantics,
+                    "OverlayBSS",
                 )
                 self.set_comment_at(bss_start_address, f"{segment_name_base} bss start")
-                # self.set_auto_segment_execute(bss_start_address, entry.bss_size, false) # mark non-executable
 
-            # --- define static initializer function ---
+            # define static initializer function symbol (analysis will create the function)
             if entry.static_initializer_start_address != 0:
-                # address might be thumb (lsb=1), adjust for function definition
                 init_start = entry.static_initializer_start_address
-                func_addr = init_start & ~1  # word-align address
+                func_addr = init_start & ~1
                 is_thumb = (init_start & 1) != 0
-
-                # check if address falls within the loaded code segment
-                if load_address <= func_addr < load_address + segment_ram_size:
+                if segment_ram_size_in_memory > 0 and (
+                    load_address
+                    <= func_addr
+                    < load_address + segment_ram_size_in_memory
+                ):
                     self.log.log_info(
-                        f"  defining {segment_name_base} static initializer at 0x{func_addr:x} {'(thumb)' if is_thumb else ''}"
+                        f"  defining symbol for {segment_name_base} static initializer at 0x{func_addr:x} {'(thumb)' if is_thumb else ''}"
                     )
-                    # todo: set thumb mode if is_thumb is true (requires api interaction or platform setting)
-                    # self.set_instruction_mode(func_addr, instructionmode.thumbmode) # example, api may differ
-                    self.add_function(func_addr)
-                    self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, func_addr, f"{segment_name_base}_Init"))  # type: ignore
+                    self.define_auto_symbol(
+                        Symbol(
+                            SymbolType.FunctionSymbol,
+                            func_addr,
+                            f"{segment_name_base}_Init",
+                        )
+                    )
                     self.set_comment_at(
-                        func_addr, f"{segment_name_base} static initializer"
+                        func_addr,
+                        f"{segment_name_base} static initializer (entry point)",
                     )
+                    # self.add_entry_point(func_addr) # consider if overlay initializers are true entry points
                 else:
                     self.log.log_warn(
-                        f"  {segment_name_base} static initializer 0x{init_start:x} is outside its ram region (0x{load_address:x} - 0x{load_address + segment_ram_size:x}). skipping definition."
+                        f"  {segment_name_base} static initializer 0x{init_start:x} is outside its loaded RAM region (or region is empty). skipping symbol definition."
                     )
-
             num_loaded += 1
 
         log_func = self.log.log_info if num_failed == 0 else self.log.log_warn
@@ -1100,166 +1162,112 @@ class NDSView(BinaryView):
         decompresses data using mii lz77 variant (backward).
         raises valueerror or eoferror on failure.
         """
-        if (
-            len(data) < 8
-        ):  # need at least footer (4 bytes) and header (4 bytes) for type 1
-            raise ValueError("data too short for mii decompression footer/header")
+        if len(data) < 4:
+            raise ValueError("data too short for mii decompression footer")
 
-        # --- read footer ---
         footer = data[-4:]
         decompressed_size = struct.unpack_from("<I", footer, 0)[0]
 
-        # --- read header (assuming it's 4 bytes before the footer) ---
-        # this part is tricky, the ghidra code reads header from `offs` which starts
-        # near the end and moves backward. let's try to read the header value directly.
-        # the header contains the compression type and compressed block size info.
-        # it seems the ghidra code uses `ioutil.readu32le(data, data.length - 8)`
-        # to get this header value before starting the loop.
+        if decompressed_size == 0 and len(data) == 4:
+            return b""
+        if decompressed_size == 0 and len(data) > 4:
+            self.log.log_warn(
+                "mii footer indicates zero decompressed size but data is present."
+            )
+
         if len(data) < 8:
-            raise ValueError("data too short for mii decompression header")
+            if decompressed_size == len(data) - 4:
+                self.log.log_info(
+                    "mii data seems uncompressed (size matches data minus footer)."
+                )
+                return data[:-4]
+            if decompressed_size == 0:
+                return b""  # empty payload from just footer
+            raise ValueError(
+                f"data too short for mii header (len {len(data)}) but decompressed_size is {decompressed_size}"
+            )
+
         header_val = struct.unpack_from("<I", data, len(data) - 8)[0]
         comp_type = (header_val >> 24) & 0xF
-        # compressed_part_size = header_val & 0xffffff # size of compressed data block excluding header/footer?
 
         if decompressed_size == 0:
-            # check if it's genuinely empty or if size is stored elsewhere for non-lz types
-            if (
-                comp_type != 1 and header_val != 0
-            ):  # maybe header_val is size for other types?
-                self.log.log_warn(
-                    f"mii compression type {comp_type} with zero size in footer, but non-zero header. assuming uncompressed."
-                )
-                return data[:-4]  # return original data minus footer as fallback
-            elif len(data) == 8 and header_val == 0:  # empty payload
+            if comp_type == 0x1 and header_val == 0x10000000:
                 return b""
-            else:
-                raise ValueError("decompressed size is zero but data is present.")
+            self.log.log_warn(
+                f"mii decompressed_size is 0, but header is 0x{header_val:x}. Assuming empty."
+            )
+            return b""
 
-        if decompressed_size < 0 or decompressed_size > 0x10000000:  # sanity check size
+        if decompressed_size > 0x10000000:  # sanity check size (256mb)
             raise ValueError(f"invalid decompressed size: 0x{decompressed_size:x}")
 
-        # --- handle type 1 lz77 ---
-        if comp_type != 1:
+        if comp_type != 0x1:
             self.log.log_warn(
-                f"mii compression type {comp_type} encountered, treating as uncompressed (returning raw data minus footer)."
+                f"mii compression type {comp_type} not 1. treating as uncompressed (data minus footer)."
             )
-            # this might be incorrect for other valid compression types, but lz77 is most common.
             return data[:-4]
 
-        # --- decompression loop ---
         result = bytearray(decompressed_size)
         dst_offs = decompressed_size
-        src_offs = len(data) - 8  # start reading before the 8-byte header/footer
+        src_offs = len(data) - 8
 
         while dst_offs > 0:
             if src_offs <= 0:
-                # check if we exhausted exactly the expected compressed size
-                # expected_src_end = len(data) - 8 - compressed_part_size
-                # if src_offs == expected_src_end: break # normal exit?
-                raise EOFError(
-                    f"mii source data exhausted unexpectedly (dst_offs={dst_offs}, src_offs={src_offs})"
-                )
-
-            # read block header byte
+                raise EOFError("mii source exhausted (block header)")
             block_header = data[src_offs - 1]
             src_offs -= 1
-
-            for i in range(8):  # process 8 blocks/literals
+            for _ in range(8):
                 if dst_offs <= 0:
-                    break  # finished decompression mid-header
-
-                if (block_header & 0x80) == 0:  # literal byte
+                    break
+                if (block_header & 0x80) == 0:  # literal
                     if src_offs <= 0:
-                        raise EOFError(
-                            f"mii source exhausted (literal byte) (dst_offs={dst_offs}, src_offs={src_offs})"
-                        )
-                    literal_byte = data[src_offs - 1]
-                    src_offs -= 1
+                        raise EOFError("mii source exhausted (literal)")
+                    result[dst_offs - 1] = data[src_offs - 1]
                     dst_offs -= 1
-                    if dst_offs < 0:
-                        raise IndexError(
-                            "mii destination offset became negative (literal)"
-                        )
-                    result[dst_offs] = literal_byte
-                else:  # lz77 copy block
+                    src_offs -= 1
+                else:  # copy
                     if src_offs <= 1:
-                        raise EOFError(
-                            f"mii source exhausted (lz77 block header) (dst_offs={dst_offs}, src_offs={src_offs})"
-                        )
+                        raise EOFError("mii source exhausted (copy params)")
                     byte1 = data[src_offs - 1]
                     byte2 = data[src_offs - 2]
                     src_offs -= 2
-
-                    # calculate length and displacement
-                    length = ((byte1 & 0xF0) >> 4) + 3  # length = 3..18
-                    disp = (((byte1 & 0x0F) << 8) | byte2) + 1  # displacement = 1..4096
-
+                    length = ((byte1 & 0xF0) >> 4) + 3
+                    disp = (((byte1 & 0x0F) << 8) | byte2) + 1
                     if dst_offs < length:
                         raise ValueError(
-                            f"mii lz77 copy length ({length}) exceeds remaining destination space ({dst_offs})"
+                            f"mii copy length ({length}) exceeds remaining dest ({dst_offs})"
                         )
-
-                    # calculate source position for copy (relative to current dest position)
-                    copy_src_base = dst_offs + disp
-                    if copy_src_base < 0 or copy_src_base > decompressed_size:
-                        raise ValueError(
-                            f"mii lz77 copy source offset out of bounds (disp={disp}, dst_offs={dst_offs}, copy_src={copy_src_base}, size={decompressed_size})"
-                        )
-
-                    # copy bytes carefully, handling potential overlaps within the result buffer
-                    try:
-                        for j in range(length):
-                            read_idx = (
-                                copy_src_base - 1 + j
-                            )  # read index relative to start of result buffer
-                            write_idx = (
-                                dst_offs - 1
-                            )  # write index relative to start of result buffer
-                            if read_idx < 0 or read_idx >= decompressed_size:
-                                raise IndexError(
-                                    f"mii lz77 read index {read_idx} out of bounds"
-                                )
-                            if write_idx < 0 or write_idx >= decompressed_size:
-                                raise IndexError(
-                                    f"mii lz77 write index {write_idx} out of bounds"
-                                )
-
-                            result[write_idx] = result[
-                                read_idx
-                            ]  # read from potentially already written part
-                            dst_offs -= 1
-                    except IndexError as ie:
-                        # provide more context on index errors
-                        raise IndexError(
-                            f"mii lz77 copy error: {ie} (length={length}, disp={disp}, dst_offs={dst_offs+length-j}, copy_src_base={copy_src_base})"
-                        )
-
-                # move to next bit in block_header
+                    for _ in range(length):
+                        current_write_idx = dst_offs - 1
+                        current_read_idx = current_write_idx + disp
+                        if not (
+                            0 <= current_read_idx < decompressed_size
+                            and 0 <= current_write_idx < decompressed_size
+                        ):
+                            raise IndexError(
+                                f"mii lz77 copy out of bounds: read_idx={current_read_idx}, write_idx={current_write_idx}, disp={disp}, len={length}, dst_rem={dst_offs}"
+                            )
+                        result[current_write_idx] = result[current_read_idx]
+                        dst_offs -= 1
                 block_header = (block_header << 1) & 0xFF
 
-                # early exit if destination is full after processing a block/literal
-                if dst_offs <= 0 and i < 7:
-                    break
-
         if dst_offs != 0:
-            # this might happen if the decompressed size in the footer was wrong
             self.log.log_warn(
-                f"mii decompression finished, but dst_offs is non-zero ({dst_offs}). possible size mismatch or data corruption."
+                f"mii decompression finished with dst_offs={dst_offs}. result may be incorrect."
             )
-            # return potentially truncated/incomplete data
-            return bytes(result[-dst_offs:])
-
         return bytes(result)
 
     def _define_io_registers(self):
         """defines symbols and tags for known nds i/o registers."""
         self.log.log_info("defining nds hardware symbols and tags...")
         for addr, name, tag_name, desc in NDS_IO_REGISTERS:
-            icon = NDS_TAG_TYPES.get(tag_name, "🔩")  # default icon
+            icon = NDS_TAG_TYPES.get(tag_name, "🔩")
             self._define_reg_with_tag(addr, name, tag_name, icon, desc)
 
     def _define_entry_points(self):
-        """defines entry points and start symbols for arm9 and arm7."""
+        """defines entry points and start symbols for arm9 and arm7.
+        functions themselves will be created by analysis.
+        """
         if not self.nds_rom or not self.nds_rom.header:
             self.log.log_error("cannot define entry points, rom header not parsed.")
             return
@@ -1267,70 +1275,71 @@ class NDSView(BinaryView):
         header = self.nds_rom.header
 
         # arm9 entry point
-        if header.arm9_size > 0:
-            entry_point = header.arm9_entry_address
-            self.log.log_info(f"defining arm9 entry point: 0x{entry_point:08x}")
-            segment_at_entry = self.get_segment_at(entry_point)
-            if segment_at_entry and segment_at_entry.executable:
-                self.add_entry_point(entry_point)
-                self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, entry_point, "_start9"))  # type: ignore
-                try:
-                    # check if lsb is 1 (thumb mode)
-                    is_thumb = (entry_point & 1) != 0
-                    func_addr = entry_point & ~1
-                    # todo: set thumb mode if necessary
-                    # if is_thumb: self.set_instruction_mode(func_addr, instructionmode.thumbmode)
-                    self.add_function(func_addr)
-                except Exception as e:
-                    self.log.log_warn(
-                        f"failed to add function at arm9 entry 0x{entry_point:x}: {e}"
-                    )
-            else:
-                self.log.log_warn(
-                    f"arm9 entry point 0x{entry_point:x} not in executable segment or segment not found."
-                )
+        arm9_load_addr = header.arm9_ram_address
+        entry_point_arm9 = header.arm9_entry_address
+        func_addr_aligned_arm9 = entry_point_arm9 & ~1
+        is_thumb_arm9 = (entry_point_arm9 & 1) != 0
+
+        segment_at_arm9_entry = self.get_segment_at(func_addr_aligned_arm9)
+        if (
+            segment_at_arm9_entry
+            and segment_at_arm9_entry.start == arm9_load_addr
+            and segment_at_arm9_entry.executable
+        ):
+            self.log.log_info(
+                f"defining arm9 entry point symbol: _start9 at 0x{func_addr_aligned_arm9:08x}{', thumb implied' if is_thumb_arm9 else ''}"
+            )
+            self.add_entry_point(func_addr_aligned_arm9)
+            self.define_auto_symbol(
+                Symbol(SymbolType.FunctionSymbol, func_addr_aligned_arm9, "_start9")
+            )
+            # self.add_function(func_addr_aligned_arm9) # removed: let analysis create it
+        else:
+            self.log.log_warn(
+                f"arm9 entry point 0x{func_addr_aligned_arm9:x} not in a valid executable segment starting at expected load address 0x{arm9_load_addr:x}. "
+                f"segment found: {segment_at_arm9_entry}. _start9 symbol/entry point may not be effective."
+            )
 
         # arm7 entry point
-        if header.arm7_size > 0:
-            entry_point = header.arm7_entry_address
-            self.log.log_info(f"defining arm7 entry point: 0x{entry_point:08x}")
-            segment_at_entry = self.get_segment_at(entry_point)
-            if segment_at_entry and segment_at_entry.executable:
-                self.add_entry_point(entry_point)
-                self.define_auto_symbol(Symbol(SymbolType.FunctionSymbol, entry_point, "_start7"))  # type: ignore
-                try:
-                    # check if lsb is 1 (thumb mode)
-                    is_thumb = (entry_point & 1) != 0
-                    func_addr = entry_point & ~1
-                    # todo: set thumb mode if necessary
-                    # if is_thumb: self.set_instruction_mode(func_addr, instructionmode.thumbmode)
-                    self.add_function(func_addr)
-                except Exception as e:
-                    self.log.log_warn(
-                        f"failed to add function at arm7 entry 0x{entry_point:x}: {e}"
-                    )
-            else:
-                self.log.log_warn(
-                    f"arm7 entry point 0x{entry_point:x} not in executable segment or segment not found."
-                )
+        arm7_load_addr = header.arm7_ram_address
+        entry_point_arm7 = header.arm7_entry_address
+        func_addr_aligned_arm7 = entry_point_arm7 & ~1
+        is_thumb_arm7 = (entry_point_arm7 & 1) != 0
 
-        # debug arm9 entry point (if applicable) - typically no defined entry in header
+        segment_at_arm7_entry = self.get_segment_at(func_addr_aligned_arm7)
+        if (
+            segment_at_arm7_entry
+            and segment_at_arm7_entry.start == arm7_load_addr
+            and segment_at_arm7_entry.executable
+        ):
+            self.log.log_info(
+                f"defining arm7 entry point symbol: _start7 at 0x{func_addr_aligned_arm7:08x}{', thumb implied' if is_thumb_arm7 else ''}"
+            )
+            self.add_entry_point(func_addr_aligned_arm7)
+            self.define_auto_symbol(
+                Symbol(SymbolType.FunctionSymbol, func_addr_aligned_arm7, "_start7")
+            )
+            # self.add_function(func_addr_aligned_arm7) # removed: let analysis create it
+        else:
+            self.log.log_warn(
+                f"arm7 entry point 0x{func_addr_aligned_arm7:x} not in a valid executable segment starting at expected load address 0x{arm7_load_addr:x}. "
+                f"segment found: {segment_at_arm7_entry}. _start7 symbol/entry point may not be effective."
+            )
+
         if header.debug_rom_offset != 0 and header.debug_size > 0:
             debug_load_addr = (
                 header.debug_ram_address
                 if header.debug_ram_address != 0
-                else 0x02400000  # common fallback address?
+                else 0x02400000
             )
             self.log.log_info(
-                f"debug arm9 loaded at 0x{debug_load_addr:08x}, no standard entry point defined."
+                f"debug arm9 seems present: rom_offset=0x{header.debug_rom_offset:x}, size=0x{header.debug_size:x}, load_addr=0x{debug_load_addr:08x}."
             )
-            # maybe add a symbol at the load address?
             self.define_auto_symbol(
                 Symbol(
                     SymbolType.DataSymbol, debug_load_addr, "arm9_debug_load_address"
                 )
             )
-            # todo: add segment/section for debug arm9 if needed
 
     # --- main initialization logic ---
 
@@ -1341,51 +1350,37 @@ class NDSView(BinaryView):
         returns:
             true on successful initialization, false otherwise.
         """
-        # platform/arch should be valid here if __init__ succeeded.
-
         try:
             self.log.log_info("starting nds rom loading process...")
 
-            # --- main loading steps ---
-            # 1. parse header and tables (adjust _parse_rom_header and ndsromreader)
             if not self._parse_rom_header():
-                return False
-            # 2. define tag types
+                self.log.log_error("initial rom header parsing failed. aborting init.")
+                return False  # ensure init fails if header parsing fails
+
             self._define_tag_types()
-            # 3. map core memory regions (ram, i/o, vram, etc.)
             self._map_memory_regions()
-            # 4. load arm9 (handles moduleparams, compression, bss)
+
             self._load_arm9()
-            # 5. load arm7 (simpler, usually raw map)
             self._load_arm7()
-            # 6. load arm9 overlays (handles compression flag, bss, initializers)
-            self._load_overlays(
-                "ARM9", self.nds_rom.arm9_overlay_table if self.nds_rom else None
-            )
-            # 7. load arm7 overlays (less common, but support structure)
-            self._load_overlays(
-                "ARM7", self.nds_rom.arm7_overlay_table if self.nds_rom else None
-            )
-            # 8. define i/o register symbols and tags
+            if self.nds_rom:
+                self._load_overlays("ARM9", self.nds_rom.arm9_overlay_table)
+                self._load_overlays("ARM7", self.nds_rom.arm7_overlay_table)
+
             self._define_io_registers()
-            # 9. define entry points
-            self._define_entry_points()
-            # 10. load debug info (optional, if present and needed)
-            # if self.nds_rom and self.nds_rom.header.debug_rom_offset != 0 and self.nds_rom.header.debug_size > 0:
-            #    self._load_debug_arm9() # assuming this helper exists or is added
+            self._define_entry_points()  # call after segments are loaded, defines symbols and entry points
 
-            # --- final analysis update ---
-            self.log.log_info("nds rom loading complete. updating analysis...")
-            self.update_analysis_and_wait()
-            self.log.log_info("analysis update finished.")
+            self.log.log_info(
+                "nds rom loading complete. triggering analysis (background)..."
+            )
+            self.update_analysis()  # changed from update_analysis_and_wait()
+            self.log.log_info("analysis update triggered.")
 
-            return True  # initialization successful
+            return True
 
         except Exception as e:
-            # catch any unexpected errors during initialization
-            log_error(f"[NDS] failed to initialize ndsview: {e}")
+            log_error(f"[NDS] critical failure during ndsview initialization: {e}")
             log_error(traceback.format_exc())
-            return False  # indicate failure
+            return False
 
     # --- required binaryview methods ---
 
@@ -1394,28 +1389,43 @@ class NDSView(BinaryView):
         return True
 
     def perform_get_entry_point(self) -> int:
-        """returns the primary (arm9) entry point address"""
+        """returns the primary (arm9) entry point address, or arm7 if arm9 is absent."""
         # this is called by the core *after* init() completes.
-        if len(self.entry_points) > 0:
-            # prefer the first entry point added (usually arm9)
-            entry = self.entry_points[0]
-            # return word-aligned address for analysis start
-            return entry & ~1
-        elif self.nds_rom and self.nds_rom.header and self.nds_rom.header.arm9_size > 0:
-            # fallback to header value if no entry points were added somehow
-            entry = self.nds_rom.header.arm9_entry_address
-            return entry & ~1
-        elif self.nds_rom and self.nds_rom.header and self.nds_rom.header.arm7_size > 0:
-            # fallback to arm7 entry if arm9 is missing but arm7 exists
-            entry = self.nds_rom.header.arm7_entry_address
-            return entry & ~1
-        else:
-            # ultimate fallback
-            self.log.log_warn(  # use self.log
-                "[NDS] perform_get_entry_point called but no entry points defined and header not parsed/empty. returning start address."
-            )
-            # return start of mapped view, or 0 if nothing mapped
-            return self.start if self.start is not None else 0
+        # self.entry_points should exist if BinaryView.__init__ completed.
+        if hasattr(self, "entry_points") and len(self.entry_points) > 0:
+            return self.entry_points[0]
+
+        # fallback if self.entry_points wasn't populated or accessible
+        self.log.log_warn(
+            "[NDS] perform_get_entry_point: self.entry_points not available or empty. attempting fallback."
+        )
+        if self.nds_rom and self.nds_rom.header:
+            arm9_entry_aligned = self.nds_rom.header.arm9_entry_address & ~1
+            segment_at_arm9_entry = self.get_segment_at(arm9_entry_aligned)
+            if (
+                segment_at_arm9_entry
+                and segment_at_arm9_entry.start == self.nds_rom.header.arm9_ram_address
+            ):
+                self.log.log_info(
+                    "[NDS] perform_get_entry_point: using arm9_entry_address from header as fallback."
+                )
+                return arm9_entry_aligned
+
+            arm7_entry_aligned = self.nds_rom.header.arm7_entry_address & ~1
+            segment_at_arm7_entry = self.get_segment_at(arm7_entry_aligned)
+            if (
+                segment_at_arm7_entry
+                and segment_at_arm7_entry.start == self.nds_rom.header.arm7_ram_address
+            ):
+                self.log.log_info(
+                    "[NDS] perform_get_entry_point: using arm7_entry_address as fallback (arm9 entry not valid/in segment)."
+                )
+                return arm7_entry_aligned
+
+        self.log.log_error(
+            "[NDS] perform_get_entry_point: no valid entry points found. returning start of view or 0."
+        )
+        return self.start if self.start is not None else 0
 
     def perform_get_address_size(self) -> int:
         """nds uses 32-bit addresses"""
