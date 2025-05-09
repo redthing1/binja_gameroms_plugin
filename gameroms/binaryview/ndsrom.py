@@ -15,1877 +15,2157 @@ from binaryninja import (
     log_error,
     log_warn,
     log_info,
+    log_debug,
 )
 from binaryninja.log import Logger
 
-
+# imports for nds rom parsing capabilities.
+# this loader relies on an external 'nds_cartridge' reader module
+# to handle the low-level details of the nds rom format.
 from ..readers.nds_cartridge import (
-    NDSRomReader,
-    NDSRom,
-    NDSCartridgeHeader,
-    NDSOverlayTable,
-    NDSFatEntry,
-    NDSOverlayEntry,
+    NDSRomReader,  # main class for reading and validating nds roms.
+    NDSRom,  # dataclass representing the entire parsed rom structure.
+    NDSOverlayTable,  # represents arm9/arm7 overlay tables.
+    NDSOverlayEntry,  # represents a single entry in an overlay table.
+    # NDSCartridgeHeader and NDSFatEntry are implicitly used via NDSRom and not directly referenced here.
 )
 
-# --- nds hardware definitions ---
+# - nds hardware definitions
 
-# dictionary mapping tag type names (proper case) to icons
-NDS_TAG_TYPES: Dict[str, str] = {
-    "Display": "🖼️",
-    "DMA": "➡️",
-    "Timers": "⏱️",
-    "Keypad": "🎮",
-    "IPC": "↔️",
-    "Gamecard": "💾",
-    "Interrupts": "⚡",
-    "Power": "🔋",
-    "Memory Control": "🐏",  # for ram, vram, tcm control registers
-    "Math": "➗",  # for hardware math units (div, sqrt)
-    "3D Engine": "🧊",
-    "Sound": "🔊",
-    "SPI": "〰️",  # for serial peripheral interface
-    "RTC": "🕒",  # real-time clock
-    "Wifi": "📡",
-    "System": "⚙️",  # for general system control, bios protection etc.
-    "ARM9 Specific": "9️⃣",  # registers only accessible/relevant to arm9
-    "ARM7 Specific": "7️⃣",  # registers only accessible/relevant to arm7
-    "Hardcoded Addr": "📍",  # special hardcoded ram addresses (e.g. irq handlers)
-    "Memory Region": "🗺️",  # for mapped memory segments
-    "Hardware Register": "🔩",  # generic fallback for i/o registers
+# this dictionary maps descriptive names of nds hardware categories (tag type names)
+# to emoji icons for better visual distinction in the binary ninja ui.
+# these names should be in proper case as they are used for creating tag types.
+NDS_TAG_TYPE_DEFINITIONS: Dict[str, str] = {
+    "Display": "🖼️",  # for 2d engines, 3d engine display aspects
+    "DMA": "➡️",  # for direct memory access controllers
+    "Timers": "⏱️",  # for hardware timers
+    "Keypad": "🎮",  # for keypad and extended key input
+    "IPC": "↔️",  # for inter-processor communication fifos
+    "Gamecard": "💾",  # for gamecard (slot-1) interface and spi
+    "Interrupts": "⚡",  # for interrupt controllers (ie, if, ime)
+    "Power": "🔋",  # for power management and halt control
+    "Memory Control": "🐏",  # for ram, vram, tcm control registers, exmemcnt
+    "Math": "➗",  # for hardware math units (divider, square root)
+    "3D Engine": "🧊",  # for 3d graphics processing unit registers
+    "Sound": "🔊",  # for sound controller registers and channels
+    "SPI": "〰️",  # for serial peripheral interface (touchscreen, firmware, rtc)
+    "RTC": "🕒",  # for real-time clock (accessed via spi)
+    "Wifi": "📡",  # for wireless communication registers and ram
+    "System": "⚙️",  # for general system control, bios protection, postflg
+    "ARM9 Specific": "9️⃣",  # for registers or features only accessible/relevant to the arm9 processor
+    "ARM7 Specific": "7️⃣",  # for registers or features only accessible/relevant to the arm7 processor
+    "Hardcoded Addr": "📍",  # for special hardcoded ram addresses (e.g., irq handlers, memory control)
+    "Memory Region": "🗺️",  # for mapped memory segments (ram, rom, i/o)
+    "Hardware Register": "🔩",  # a generic fallback for i/o registers not fitting other categories
 }
 
 # list of known i/o registers: (address, name, tag_type_name, description from tech docs)
-# names and descriptions use proper case for symbols/comments. tag_type_name matches nds_tag_types keys.
-NDS_IO_REGISTERS: List[Tuple[int, str, str, str]] = [
-    # --- arm9 and arm7 common i/o registers (accessible by both cpus, though some may be specific in function) ---
-    # --- display status / vertical count (shared between 2d engine a and b) ---
-    (
-        0x4000004,
-        "REG_DISPSTAT",
-        "Display",
-        "General LCD Status (R/W)",
-    ),  # shared by 2d engine a & b
-    (
-        0x4000006,
-        "REG_VCOUNT",
-        "Display",
-        "Vertical Counter (Read only)",
-    ),  # shared by 2d engine a & b
-    # --- dma channels 0-3 (shared base address, individual control/functionality per cpu) ---
-    (0x40000B0, "REG_DMA0SAD", "DMA", "DMA 0 Source Address (R/W)"),
-    (0x40000B4, "REG_DMA0DAD", "DMA", "DMA 0 Destination Address (R/W)"),
-    (0x40000B8, "REG_DMA0CNT_L", "DMA", "DMA 0 Word Count (R/W)"),
-    (0x40000BA, "REG_DMA0CNT_H", "DMA", "DMA 0 Control (R/W)"),
-    (0x40000BC, "REG_DMA1SAD", "DMA", "DMA 1 Source Address (R/W)"),
-    (0x40000C0, "REG_DMA1DAD", "DMA", "DMA 1 Destination Address (R/W)"),
-    (0x40000C4, "REG_DMA1CNT_L", "DMA", "DMA 1 Word Count (R/W)"),
-    (0x40000C6, "REG_DMA1CNT_H", "DMA", "DMA 1 Control (R/W)"),
-    (0x40000C8, "REG_DMA2SAD", "DMA", "DMA 2 Source Address (R/W)"),
-    (0x40000CC, "REG_DMA2DAD", "DMA", "DMA 2 Destination Address (R/W)"),
-    (0x40000D0, "REG_DMA2CNT_L", "DMA", "DMA 2 Word Count (R/W)"),
-    (0x40000D2, "REG_DMA2CNT_H", "DMA", "DMA 2 Control (R/W)"),
-    (0x40000D4, "REG_DMA3SAD", "DMA", "DMA 3 Source Address (R/W)"),
-    (0x40000D8, "REG_DMA3DAD", "DMA", "DMA 3 Destination Address (R/W)"),
-    (0x40000DC, "REG_DMA3CNT_L", "DMA", "DMA 3 Word Count (R/W)"),
-    (0x40000DE, "REG_DMA3CNT_H", "DMA", "DMA 3 Control (R/W)"),
-    # --- dma fill registers (arm9 i/o map lists these, arm7 does not; primarily arm9) ---
-    (0x40000E0, "REG_DMA0FILL", "DMA", "DMA 0 Fill Data (W) (ARM9)"),
-    (0x40000E4, "REG_DMA1FILL", "DMA", "DMA 1 Fill Data (W) (ARM9)"),
-    (0x40000E8, "REG_DMA2FILL", "DMA", "DMA 2 Fill Data (W) (ARM9)"),
-    (0x40000EC, "REG_DMA3FILL", "DMA", "DMA 3 Fill Data (W) (ARM9)"),
-    # --- timers 0-3 (shared base address) ---
-    (0x4000100, "REG_TM0CNT_L", "Timers", "Timer 0 Data/Reload (R/W)"),
-    (0x4000102, "REG_TM0CNT_H", "Timers", "Timer 0 Control (R/W)"),
-    (0x4000104, "REG_TM1CNT_L", "Timers", "Timer 1 Data/Reload (R/W)"),
-    (0x4000106, "REG_TM1CNT_H", "Timers", "Timer 1 Control (R/W)"),
-    (0x4000108, "REG_TM2CNT_L", "Timers", "Timer 2 Data/Reload (R/W)"),
-    (0x400010A, "REG_TM2CNT_H", "Timers", "Timer 2 Control (R/W)"),
-    (0x400010C, "REG_TM3CNT_L", "Timers", "Timer 3 Data/Reload (R/W)"),
-    (0x400010E, "REG_TM3CNT_H", "Timers", "Timer 3 Control (R/W)"),
-    # --- keypad input (shared) ---
-    (0x4000130, "REG_KEYINPUT", "Keypad", "Key Status (Read only)"),
-    (0x4000132, "REG_KEYCNT", "Keypad", "Key Interrupt Control (R/W)"),
-    # --- inter-processor communication (ipc) fifo (shared) ---
-    (0x4000180, "REG_IPCSYNC", "IPC", "IPC Synchronize Register (R/W)"),
-    (0x4000184, "REG_IPCFIFOCNT", "IPC", "IPC FIFO Control Register (R/W)"),
-    (0x4000188, "REG_IPCFIFOSEND", "IPC", "IPC Send FIFO (Write only)"),
-    (
-        0x4100000,
-        "REG_IPCFIFORECV",
-        "IPC",
-        "IPC Receive FIFO (Read only)",
-    ),  # note different base for arm9/arm7 receive
-    # --- gamecard (slot-1) interface (shared) ---
-    (
-        0x40001A0,
-        "REG_AUXSPICNT",
-        "Gamecard",
-        "Gamecard ROM and SPI Control (R/W)",
-    ),  # also called romctrl1 by some sources
-    (0x40001A2, "REG_AUXSPIDATA", "Gamecard", "Gamecard SPI Bus Data/Strobe (R/W)"),
-    (
-        0x40001A4,
-        "REG_ROMCTRL",
-        "Gamecard",
-        "Gamecard Bus Timing/Control (R/W)",
-    ),  # also called romctrl2
-    (0x40001A8, "REG_CARDCMD", "Gamecard", "Gamecard Bus Command Out (8 bytes) (W)"),
-    (
-        0x4100010,
-        "REG_CARDDATA",
-        "Gamecard",
-        "Gamecard Bus Data In (4 bytes) (Read only)",
-    ),  # note different base for data in
-    # --- gamecard encryption seeds (shared, though primarily used by arm9 for setup) ---
-    (
-        0x40001B0,
-        "REG_CARD_SECKEY1_L",
-        "Gamecard",
-        "Gamecard Encryption Seed 0 Lower 32bit (R/W)",
-    ),
-    (
-        0x40001B4,
-        "REG_CARD_SECKEY2_L",
-        "Gamecard",
-        "Gamecard Encryption Seed 1 Lower 32bit (R/W)",
-    ),
-    (
-        0x40001B8,
-        "REG_CARD_SECKEY1_H",
-        "Gamecard",
-        "Gamecard Encryption Seed 0 Upper 7bit (R/W)",
-    ),
-    (
-        0x40001BA,
-        "REG_CARD_SECKEY2_H",
-        "Gamecard",
-        "Gamecard Encryption Seed 1 Upper 7bit (R/W)",
-    ),
-    # --- interrupt master enable / enable / flags (shared) ---
-    (0x4000208, "REG_IME", "Interrupts", "Interrupt Master Enable (0/1) (R/W)"),
-    (0x4000210, "REG_IE", "Interrupts", "Interrupt Enable Bits (R/W)"),
-    (
-        0x4000214,
-        "REG_IF",
-        "Interrupts",
-        "Interrupt Request Flags (R/W, write 1 to clear)",
-    ),
-    # --- system control (shared, some undocumented or behavior differs) ---
-    (0x4000300, "REG_POSTFLG", "System", "POST Boot Flag (R/W, Undocumented)"),
-    (
-        0x4000301,
-        "REG_HALTCNT",
-        "Power",
-        "Power Down Control / Halt Control (W) (NDS bits differ from GBA)",
-    ),
-    # --- arm9 specific i/o registers ---
-    # --- arm9 2d engine a ---
-    (0x4000000, "REG_DISPCNT_A", "Display", "2D Engine A - LCD Control (R/W) (ARM9)"),
-    # 0x4000008 - 0x4000055 : 2D Engine A BG/Window/Mosaic/Blend registers (similar to GBA)
-    (0x4000008, "REG_BG0CNT_A", "Display", "2D Engine A - BG0 Control (R/W) (ARM9)"),
-    (0x400000A, "REG_BG1CNT_A", "Display", "2D Engine A - BG1 Control (R/W) (ARM9)"),
-    (0x400000C, "REG_BG2CNT_A", "Display", "2D Engine A - BG2 Control (R/W) (ARM9)"),
-    (0x400000E, "REG_BG3CNT_A", "Display", "2D Engine A - BG3 Control (R/W) (ARM9)"),
-    (0x4000010, "REG_BG0HOFS_A", "Display", "2D Engine A - BG0 X-Offset (W) (ARM9)"),
-    (0x4000012, "REG_BG0VOFS_A", "Display", "2D Engine A - BG0 Y-Offset (W) (ARM9)"),
-    (0x4000014, "REG_BG1HOFS_A", "Display", "2D Engine A - BG1 X-Offset (W) (ARM9)"),
-    (0x4000016, "REG_BG1VOFS_A", "Display", "2D Engine A - BG1 Y-Offset (W) (ARM9)"),
-    (0x4000018, "REG_BG2HOFS_A", "Display", "2D Engine A - BG2 X-Offset (W) (ARM9)"),
-    (0x400001A, "REG_BG2VOFS_A", "Display", "2D Engine A - BG2 Y-Offset (W) (ARM9)"),
-    (0x400001C, "REG_BG3HOFS_A", "Display", "2D Engine A - BG3 X-Offset (W) (ARM9)"),
-    (0x400001E, "REG_BG3VOFS_A", "Display", "2D Engine A - BG3 Y-Offset (W) (ARM9)"),
-    (
-        0x4000020,
-        "REG_BG2PA_A",
-        "Display",
-        "2D Engine A - BG2 Rotation/Scaling Parameter A (dx) (W) (ARM9)",
-    ),
-    (
-        0x4000022,
-        "REG_BG2PB_A",
-        "Display",
-        "2D Engine A - BG2 Rotation/Scaling Parameter B (dmx) (W) (ARM9)",
-    ),
-    (
-        0x4000024,
-        "REG_BG2PC_A",
-        "Display",
-        "2D Engine A - BG2 Rotation/Scaling Parameter C (dy) (W) (ARM9)",
-    ),
-    (
-        0x4000026,
-        "REG_BG2PD_A",
-        "Display",
-        "2D Engine A - BG2 Rotation/Scaling Parameter D (dmy) (W) (ARM9)",
-    ),
-    (
-        0x4000028,
-        "REG_BG2X_A",
-        "Display",
-        "2D Engine A - BG2 Reference Point X (Internal) (W) (ARM9)",
-    ),
-    (
-        0x400002C,
-        "REG_BG2Y_A",
-        "Display",
-        "2D Engine A - BG2 Reference Point Y (Internal) (W) (ARM9)",
-    ),
-    (
-        0x4000030,
-        "REG_BG3PA_A",
-        "Display",
-        "2D Engine A - BG3 Rotation/Scaling Parameter A (dx) (W) (ARM9)",
-    ),
-    (
-        0x4000032,
-        "REG_BG3PB_A",
-        "Display",
-        "2D Engine A - BG3 Rotation/Scaling Parameter B (dmx) (W) (ARM9)",
-    ),
-    (
-        0x4000034,
-        "REG_BG3PC_A",
-        "Display",
-        "2D Engine A - BG3 Rotation/Scaling Parameter C (dy) (W) (ARM9)",
-    ),
-    (
-        0x4000036,
-        "REG_BG3PD_A",
-        "Display",
-        "2D Engine A - BG3 Rotation/Scaling Parameter D (dmy) (W) (ARM9)",
-    ),
-    (
-        0x4000038,
-        "REG_BG3X_A",
-        "Display",
-        "2D Engine A - BG3 Reference Point X (Internal) (W) (ARM9)",
-    ),
-    (
-        0x400003C,
-        "REG_BG3Y_A",
-        "Display",
-        "2D Engine A - BG3 Reference Point Y (Internal) (W) (ARM9)",
-    ),
-    (
-        0x4000040,
-        "REG_WIN0H_A",
-        "Display",
-        "2D Engine A - Window 0 Horizontal Dimensions (W) (ARM9)",
-    ),
-    (
-        0x4000042,
-        "REG_WIN1H_A",
-        "Display",
-        "2D Engine A - Window 1 Horizontal Dimensions (W) (ARM9)",
-    ),
-    (
-        0x4000044,
-        "REG_WIN0V_A",
-        "Display",
-        "2D Engine A - Window 0 Vertical Dimensions (W) (ARM9)",
-    ),
-    (
-        0x4000046,
-        "REG_WIN1V_A",
-        "Display",
-        "2D Engine A - Window 1 Vertical Dimensions (W) (ARM9)",
-    ),
-    (
-        0x4000048,
-        "REG_WININ_A",
-        "Display",
-        "2D Engine A - Inside Window 0/1 Control (R/W) (ARM9)",
-    ),
-    (
-        0x400004A,
-        "REG_WINOUT_A",
-        "Display",
-        "2D Engine A - Inside OBJ/Outside Window Control (R/W) (ARM9)",
-    ),
-    (0x400004C, "REG_MOSAIC_A", "Display", "2D Engine A - Mosaic Size (W) (ARM9)"),
-    (
-        0x4000050,
-        "REG_BLDCNT_A",
-        "Display",
-        "2D Engine A - Color Special Effects Control (R/W) (ARM9)",
-    ),
-    (
-        0x4000052,
-        "REG_BLDALPHA_A",
-        "Display",
-        "2D Engine A - Alpha Blending Coefficients (R/W) (ARM9)",
-    ),
-    (
-        0x4000054,
-        "REG_BLDY_A",
-        "Display",
-        "2D Engine A - Brightness Coefficient (W) (ARM9)",
-    ),
-    # --- arm9 3d display / capture / master bright ---
-    (
-        0x4000060,
-        "REG_DISP3DCNT",
-        "3D Engine",
-        "3D Display Control Register (R/W) (ARM9)",
-    ),
-    (
-        0x4000064,
-        "REG_DISPCAPCNT",
-        "Display",
-        "Display Capture Control Register (R/W) (ARM9)",
-    ),
-    (
-        0x4000068,
-        "REG_DISP_MMEM_FIFO",
-        "Display",
-        "Main Memory Display FIFO (R?/W) (ARM9)",
-    ),  # for transferring data to VRAM for display
-    (
-        0x400006C,
-        "REG_MASTER_BRIGHT_A",
-        "Display",
-        "2D Engine A - Master Brightness Up/Down (W) (ARM9)",
-    ),
-    # --- arm9 memory control (exmemcnt, vram/wram cnt) ---
-    (
-        0x4000204,
-        "REG_EXMEMCNT",
-        "Memory Control",
-        "External Memory Control (GBA Slot, etc.) (R/W) (ARM9)",
-    ),
-    (
-        0x4000240,
-        "REG_VRAMCNT_A",
-        "Memory Control",
-        "VRAM-A (128K) Bank Control (W) (ARM9)",
-    ),
-    (
-        0x4000241,
-        "REG_VRAMCNT_B",
-        "Memory Control",
-        "VRAM-B (128K) Bank Control (W) (ARM9)",
-    ),
-    (
-        0x4000242,
-        "REG_VRAMCNT_C",
-        "Memory Control",
-        "VRAM-C (128K) Bank Control (W) (ARM9)",
-    ),
-    (
-        0x4000243,
-        "REG_VRAMCNT_D",
-        "Memory Control",
-        "VRAM-D (128K) Bank Control (W) (ARM9)",
-    ),
-    (
-        0x4000244,
-        "REG_VRAMCNT_E",
-        "Memory Control",
-        "VRAM-E (64K) Bank Control (W) (ARM9)",
-    ),
-    (
-        0x4000245,
-        "REG_VRAMCNT_F",
-        "Memory Control",
-        "VRAM-F (16K) Bank Control (W) (ARM9)",
-    ),
-    (
-        0x4000246,
-        "REG_VRAMCNT_G",
-        "Memory Control",
-        "VRAM-G (16K) Bank Control (W) (ARM9)",
-    ),
-    (
-        0x4000247,
-        "REG_WRAMCNT",
-        "Memory Control",
-        "WRAM Bank Control (for Shared WRAM) (W) (ARM9)",
-    ),
-    (
-        0x4000248,
-        "REG_VRAMCNT_H",
-        "Memory Control",
-        "VRAM-H (32K) Bank Control (W) (ARM9)",
-    ),
-    (
-        0x4000249,
-        "REG_VRAMCNT_I",
-        "Memory Control",
-        "VRAM-I (16K) Bank Control (W) (ARM9)",
-    ),
-    # --- arm9 math hardware (division, square root) ---
-    (0x4000280, "REG_DIVCNT", "Math", "Division Control (R/W) (ARM9)"),
-    (0x4000290, "REG_DIV_NUMER", "Math", "Division Numerator (64-bit) (R/W) (ARM9)"),
-    (0x4000298, "REG_DIV_DENOM", "Math", "Division Denominator (64-bit) (R/W) (ARM9)"),
-    (
-        0x40002A0,
-        "REG_DIV_RESULT",
-        "Math",
-        "Division Quotient Result (64-bit) (Read only) (ARM9)",
-    ),
-    (
-        0x40002A8,
-        "REG_DIVREM_RESULT",
-        "Math",
-        "Division Remainder Result (64-bit) (Read only) (ARM9)",
-    ),
-    (0x40002B0, "REG_SQRTCNT", "Math", "Square Root Control (R/W) (ARM9)"),
-    (
-        0x40002B4,
-        "REG_SQRT_RESULT",
-        "Math",
-        "Square Root Result (32-bit) (Read only) (ARM9)",
-    ),
-    (
-        0x40002B8,
-        "REG_SQRT_PARAM",
-        "Math",
-        "Square Root Parameter Input (64-bit) (R/W) (ARM9)",
-    ),
-    (
-        0x4000304,
-        "REG_POWCNT1",
-        "Power",
-        "Graphics Power Control Register (R/W) (ARM9)",
-    ),  # also system power
-    # --- arm9 3d engine registers (block defined, specific registers are numerous) ---
-    (
-        0x4000320,
-        "NDS9_3D_REGS_START",
-        "3D Engine",
-        "NDS ARM9 3D Registers Start (ARM9)",
-    ),
-    (0x40006A3, "NDS9_3D_REGS_END", "3D Engine", "NDS ARM9 3D Registers End (ARM9)"),
-    # --- arm9 2d engine b ---
-    (0x4001000, "REG_DISPCNT_B", "Display", "2D Engine B - LCD Control (R/W) (ARM9)"),
-    # 0x4001008 - 0x4001055 : 2D Engine B BG/Window/Mosaic/Blend registers
-    (0x4001008, "REG_BG0CNT_B", "Display", "2D Engine B - BG0 Control (R/W) (ARM9)"),
-    (0x400100A, "REG_BG1CNT_B", "Display", "2D Engine B - BG1 Control (R/W) (ARM9)"),
-    (0x400100C, "REG_BG2CNT_B", "Display", "2D Engine B - BG2 Control (R/W) (ARM9)"),
-    (0x400100E, "REG_BG3CNT_B", "Display", "2D Engine B - BG3 Control (R/W) (ARM9)"),
-    (0x4001010, "REG_BG0HOFS_B", "Display", "2D Engine B - BG0 X-Offset (W) (ARM9)"),
-    (0x4001012, "REG_BG0VOFS_B", "Display", "2D Engine B - BG0 Y-Offset (W) (ARM9)"),
-    # ... (other BG H/V OFS, PA-PD, X/Y for Engine B) ...
-    (
-        0x4001040,
-        "REG_WIN0H_B",
-        "Display",
-        "2D Engine B - Window 0 Horizontal Dimensions (W) (ARM9)",
-    ),
-    # ... (other WIN H/V, WININ/OUT, MOSAIC, BLD for Engine B) ...
-    (
-        0x4001050,
-        "REG_BLDCNT_B",
-        "Display",
-        "2D Engine B - Color Special Effects Control (R/W) (ARM9)",
-    ),
-    (
-        0x4001052,
-        "REG_BLDALPHA_B",
-        "Display",
-        "2D Engine B - Alpha Blending Coefficients (R/W) (ARM9)",
-    ),
-    (
-        0x4001054,
-        "REG_BLDY_B",
-        "Display",
-        "2D Engine B - Brightness Coefficient (W) (ARM9)",
-    ),
-    (
-        0x400106C,
-        "REG_MASTER_BRIGHT_B",
-        "Display",
-        "2D Engine B - Master Brightness Up/Down (W) (ARM9)",
-    ),
-    # --- arm7 specific i/o registers ---
-    # (note: some shared registers like dma, timers, keypad, ipc, gamecard, ime/ie/if are listed above)
-    (
-        0x4000136,
-        "REG_EXTKEYIN",
-        "Keypad",
-        "Extended Key Input (Lid, Touchscreen presence) (Read only) (ARM7)",
-    ),
-    (
-        0x4000138,
-        "REG_RTCDATA",
-        "RTC",
-        "RTC Realtime Clock SPI Bus Data (R/W) (ARM7)",
-    ),  # accessed via spi
-    (
-        0x40001C0,
-        "REG_SPICNT",
-        "SPI",
-        "SPI Bus Control (Firmware, Touchscreen, Powerman) (R/W) (ARM7)",
-    ),
-    (0x40001C2, "REG_SPIDATA", "SPI", "SPI Bus Data (R/W) (ARM7)"),
-    (
-        0x4000204,
-        "REG_EXMEMSTAT",
-        "Memory Control",
-        "External Memory Status (Read Only) (ARM7)",
-    ),  # distinct from arm9's exmemcnt
-    # 0x4000206h WIFIWAITCNT (ARM7) - not in current list, could be added
-    (
-        0x4000240,
-        "REG_VRAMSTAT",
-        "Memory Control",
-        "VRAM-C,D Bank Status (Read only) (ARM7)",
-    ),
-    (
-        0x4000241,
-        "REG_WRAMSTAT",
-        "Memory Control",
-        "WRAM Bank Status (for Shared WRAM) (Read only) (ARM7)",
-    ),
-    (
-        0x4000304,
-        "REG_POWCNT2",
-        "Power",
-        "Sound/Wifi Power Control Register (R/W) (ARM7)",
-    ),
-    (0x4000308, "REG_BIOSPROT", "System", "BIOS Write Protection Address (W) (ARM7)"),
-    # --- arm7 sound registers (block defined) ---
-    (
-        0x4000400,
-        "NDS7_SOUND_REGS_START",
-        "Sound",
-        "NDS ARM7 Sound Registers Start (ARM7)",
-    ),
-    # individual sound channel registers 0x4000400 - 0x40004EF (16 channels * 0x10 bytes)
-    (
-        0x4000500,
-        "REG_SOUNDCNT",
-        "Sound",
-        "Sound Control Register (Master Enable, Mixing) (R/W) (ARM7)",
-    ),
-    (0x4000504, "REG_SOUNDBIAS", "Sound", "Sound Bias Register (R/W) (ARM7)"),
-    (0x4000508, "REG_SNDCAP0CNT", "Sound", "Sound Capture 0 Control (R/W) (ARM7)"),
-    (0x4000509, "REG_SNDCAP1CNT", "Sound", "Sound Capture 1 Control (R/W) (ARM7)"),
-    (
-        0x4000510,
-        "REG_SNDCAP0DAD",
-        "Sound",
-        "Sound Capture 0 Destination Address (R/W) (ARM7)",
-    ),
-    (0x4000514, "REG_SNDCAP0LEN", "Sound", "Sound Capture 0 Length (W) (ARM7)"),
-    (
-        0x4000518,
-        "REG_SNDCAP1DAD",
-        "Sound",
-        "Sound Capture 1 Destination Address (R/W) (ARM7)",
-    ),
-    (0x400051C, "REG_SNDCAP1LEN", "Sound", "Sound Capture 1 Length (W) (ARM7)"),
-    (
-        0x400051F,
-        "NDS7_SOUND_REGS_END",
-        "Sound",
-        "NDS ARM7 Sound Registers End (ARM7)",
-    ),  # approx end
-    # --- arm7 wlan registers (block defined) ---
-    (
-        0x4800000,
-        "NDS7_WIFI_REGS_START",
-        "Wifi",
-        "NDS ARM7 Wifi Registers Start (Ports and RAM) (ARM7)",
-    ),
-    # includes 8kb wifi ram at 0x4804000
-    (
-        0x4807FFF,
-        "NDS7_WIFI_REGS_END",
-        "Wifi",
-        "NDS ARM7 Wifi Registers End (WS0) (ARM7)",
-    ),  # end of 32k ws0 region
-    # 0x4808000h  ..  Wifi WS1 Region (32K) (mirror of above, other waitstates) - not explicitly mapped as a separate symbol block
-    # --- hardcoded ram addresses (mostly for exception/irq handlers) ---
-    # arm9 dtcm addresses for irq handler are usually relative to dtcm base, which is variable.
-    # current loader maps dtcm at 0x027c0000. so, dtcm+3ff8 would be 0x027c3ff8.
-    (
-        0x027C3FF8,
-        "NDS9_IRQ_CHECKBITS_DTCM",
-        "Hardcoded Addr",
-        "ARM9 IRQ 'IF' Check Bits (in DTCM, assuming DTCM@0x027C0000)",
-    ),
-    (
-        0x027C3FFC,
-        "NDS9_IRQ_HANDLER_PTR_DTCM",
-        "Hardcoded Addr",
-        "ARM9 Pointer to IRQ Handler (in DTCM, assuming DTCM@0x027C0000)",
-    ),
-    (
-        0x0380FFF8,
-        "NDS7_IRQ_CHECKBITS",
-        "Hardcoded Addr",
-        "ARM7 IRQ 'IF' Check Bits (in ARM7 WRAM)",
-    ),
-    (
-        0x0380FFFC,
-        "NDS7_IRQ_HANDLER_PTR",
-        "Hardcoded Addr",
-        "ARM7 Pointer to IRQ Handler (in ARM7 WRAM)",
-    ),
-    (
-        0x027FFFFE,
-        "MAIN_MEM_CNT",
-        "Hardcoded Addr",
-        "Main Memory Control (R/W)",
-    ),  # affects arm9 memory mapping
+# names and descriptions use proper case for symbols/comments. tag_type_name matches NDS_TAG_TYPE_DEFINITIONS keys.
+# this list will be populated separately.
+# list of known nintendo ds i/o registers
+# format: (address, name, tag_type_name, description from tech docs)
+# names and descriptions use proper case for symbols/comments, adhering to binary ninja conventions.
+# tag_type_name corresponds to keys in the NDS_TAG_TYPE_DEFINITIONS dictionary.
+# fmt: off
+NDS_IO_REGISTERS = [
+    # - arm9 i/o map
+    # these registers are primarily accessed or exclusively available to the arm9 processor.
+
+    # - arm9 display engine a (main screen: 0x04000000 - 0x0400006f)
+    # controls for the main 2d graphics engine (engine a).
+    (0x04000000, "DISPCNT_A", "Display", "2D Engine A - LCD Control (ARM9)"),
+    # general lcd status, shared between engine a and b, but listed here under arm9 context.
+    (0x04000004, "DISPSTAT", "Display", "General LCD Status (Shared A+B)"),
+    # vertical counter, shared, indicates current scanline.
+    (0x04000006, "VCOUNT", "Display", "Vertical Counter (Shared A+B, Read-only)"),
+
+    # - 2d engine a: background, affine, window, and effects (0x04000008 - 0x04000057)
+    # this block (0x50 bytes) covers detailed controls for backgrounds, affine transformations,
+    # windowing, mosaic, and blending effects for engine a.
+    # background controls (bg0-bg3)
+    (0x04000008, "BG0CNT_A", "Display", "2D Engine A - BG0 Control (ARM9)"),
+    (0x0400000A, "BG1CNT_A", "Display", "2D Engine A - BG1 Control (ARM9)"),
+    (0x0400000C, "BG2CNT_A", "Display", "2D Engine A - BG2 Control (ARM9)"),
+    (0x0400000E, "BG3CNT_A", "Display", "2D Engine A - BG3 Control (ARM9)"),
+    (0x04000010, "BG0HOFS_A", "Display", "2D Engine A - BG0 X-Offset (ARM9)"),
+    (0x04000012, "BG0VOFS_A", "Display", "2D Engine A - BG0 Y-Offset (ARM9)"),
+    (0x04000014, "BG1HOFS_A", "Display", "2D Engine A - BG1 X-Offset (ARM9)"),
+    (0x04000016, "BG1VOFS_A", "Display", "2D Engine A - BG1 Y-Offset (ARM9)"),
+    (0x04000018, "BG2HOFS_A", "Display", "2D Engine A - BG2 X-Offset (ARM9)"),
+    (0x0400001A, "BG2VOFS_A", "Display", "2D Engine A - BG2 Y-Offset (ARM9)"),
+    (0x0400001C, "BG3HOFS_A", "Display", "2D Engine A - BG3 X-Offset (ARM9)"),
+    (0x0400001E, "BG3VOFS_A", "Display", "2D Engine A - BG3 Y-Offset (ARM9)"),
+    # background 2 affine transformation parameters
+    (0x04000020, "BG2PA_A", "Display", "2D Engine A - BG2 Rotation/Scaling Parameter A (dx) (ARM9)"),
+    (0x04000022, "BG2PB_A", "Display", "2D Engine A - BG2 Rotation/Scaling Parameter B (dmx) (ARM9)"),
+    (0x04000024, "BG2PC_A", "Display", "2D Engine A - BG2 Rotation/Scaling Parameter C (dy) (ARM9)"),
+    (0x04000026, "BG2PD_A", "Display", "2D Engine A - BG2 Rotation/Scaling Parameter D (dmy) (ARM9)"),
+    (0x04000028, "BG2X_L_A", "Display", "2D Engine A - BG2 Reference Point X-Coordinate, Low (Internal) (ARM9)"),
+    (0x0400002A, "BG2X_H_A", "Display", "2D Engine A - BG2 Reference Point X-Coordinate, High (Internal) (ARM9)"),
+    (0x0400002C, "BG2Y_L_A", "Display", "2D Engine A - BG2 Reference Point Y-Coordinate, Low (Internal) (ARM9)"),
+    (0x0400002E, "BG2Y_H_A", "Display", "2D Engine A - BG2 Reference Point Y-Coordinate, High (Internal) (ARM9)"),
+    # background 3 affine transformation parameters
+    (0x04000030, "BG3PA_A", "Display", "2D Engine A - BG3 Rotation/Scaling Parameter A (dx) (ARM9)"),
+    (0x04000032, "BG3PB_A", "Display", "2D Engine A - BG3 Rotation/Scaling Parameter B (dmx) (ARM9)"),
+    (0x04000034, "BG3PC_A", "Display", "2D Engine A - BG3 Rotation/Scaling Parameter C (dy) (ARM9)"),
+    (0x04000036, "BG3PD_A", "Display", "2D Engine A - BG3 Rotation/Scaling Parameter D (dmy) (ARM9)"),
+    (0x04000038, "BG3X_L_A", "Display", "2D Engine A - BG3 Reference Point X-Coordinate, Low (Internal) (ARM9)"),
+    (0x0400003A, "BG3X_H_A", "Display", "2D Engine A - BG3 Reference Point X-Coordinate, High (Internal) (ARM9)"),
+    (0x0400003C, "BG3Y_L_A", "Display", "2D Engine A - BG3 Reference Point Y-Coordinate, Low (Internal) (ARM9)"),
+    (0x0400003E, "BG3Y_H_A", "Display", "2D Engine A - BG3 Reference Point Y-Coordinate, High (Internal) (ARM9)"),
+    # windowing controls
+    (0x04000040, "WIN0H_A", "Display", "2D Engine A - Window 0 Horizontal Dimensions (ARM9)"),
+    (0x04000042, "WIN1H_A", "Display", "2D Engine A - Window 1 Horizontal Dimensions (ARM9)"),
+    (0x04000044, "WIN0V_A", "Display", "2D Engine A - Window 0 Vertical Dimensions (ARM9)"),
+    (0x04000046, "WIN1V_A", "Display", "2D Engine A - Window 1 Vertical Dimensions (ARM9)"),
+    (0x04000048, "WININ_A", "Display", "2D Engine A - Inside Window Control (ARM9)"),
+    (0x0400004A, "WINOUT_A", "Display", "2D Engine A - Outside Window and OBJ Window Control (ARM9)"),
+    # mosaic and blending controls
+    (0x0400004C, "MOSAIC_A", "Display", "2D Engine A - Mosaic Size (ARM9)"),
+    (0x04000050, "BLDCNT_A", "Display", "2D Engine A - Blend Control (ARM9)"),
+    (0x04000052, "BLDALPHA_A", "Display", "2D Engine A - Blend Alpha Coefficients (ARM9)"),
+    (0x04000054, "BLDY_A", "Display", "2D Engine A - Blend Brightness (Fade) Coefficient (ARM9)"),
+
+    # - 3d display, capture, and main memory fifo (0x04000060 - 0x0400006f)
+    (0x04000060, "DISP3DCNT", "3D Engine", "3D Display Control Register (ARM9)"), # Also Display
+    (0x04000064, "DISPCAPCNT", "Display", "Display Capture Control Register (ARM9)"),
+    (0x04000068, "DISP_MMEM_FIFO", "Display", "Main Memory Display FIFO (ARM9)"),
+    (0x0400006C, "MASTER_BRIGHT_A", "Display", "2D Engine A - Master Brightness (ARM9)"),
 ]
+# fmt: on
 
-# --- nitro sdk constants ---
-NITRO_SDK_MODULE_PARAMS_MAGIC = b"\x21\x06\xc0\xde\xde\xc0\x06\x21"
-NITRO_SDK_MODULE_PARAMS_SIZE = 36  # size of the moduleparams struct
-NITRO_SDK_MODULE_PARAMS_MAGIC_OFFSET = 0x1C  # offset of magic within the struct
+# - dma channels (0x040000b0 - 0x040000de)
+# these are shared between arm9 and arm7, but typically configured by arm9.
+# dma channel registers are repeated for channels 0 through 3.
+_dma_base = 0x040000B0
+for _i in range(4):
+    # dma source address (32-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _dma_base + _i * 0xC + 0x0,
+            f"DMA{_i}SAD",
+            "DMA",
+            f"DMA Channel {_i} Source Address (Shared)",
+        )
+    )
+    # dma destination address (32-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _dma_base + _i * 0xC + 0x4,
+            f"DMA{_i}DAD",
+            "DMA",
+            f"DMA Channel {_i} Destination Address (Shared)",
+        )
+    )
+    # dma word count (16-bit) and control (16-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _dma_base + _i * 0xC + 0x8,
+            f"DMA{_i}CNT",
+            "DMA",
+            f"DMA Channel {_i} Control & Word Count (Shared)",
+        )
+    )
 
-# --- ndsview class definition ---
+# - dma fill registers (0x040000e0 - 0x040000ef)
+# arm9 specific registers for dma fill operations.
+_dma_fill_base = 0x040000E0
+for _i in range(4):
+    # dma fill data (32-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _dma_fill_base + _i * 0x4,
+            f"DMA{_i}FILL",
+            "DMA",
+            f"DMA Channel {_i} Fill Data (ARM9 Specific)",
+        )
+    )
+
+# - timers (0x04000100 - 0x0400010f)
+# four 16-bit timers, shared between arm9 and arm7.
+_timer_base = 0x04000100
+for _i in range(4):
+    # timer data/reload value (16-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _timer_base + _i * 0x4 + 0x0,
+            f"TM{_i}D",
+            "Timers",
+            f"Timer {_i} Data/Reload Value (Shared)",
+        )
+    )
+    # timer control (16-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _timer_base + _i * 0x4 + 0x2,
+            f"TM{_i}CNT",
+            "Timers",
+            f"Timer {_i} Control (Shared)",
+        )
+    )
+
+# fmt: off
+NDS_IO_REGISTERS.extend([
+    # - keypad input (0x04000130 - 0x04000133)
+    # shared keypad registers.
+    (0x04000130, "KEYINPUT", "Keypad", "Key Input Status (Shared, Read-only)"),
+    (0x04000132, "KEYCNT", "Keypad", "Key Interrupt Control (Shared)"),
+
+    # - ipc and gamecard interface (0x04000180 - 0x040001bb)
+    # inter-processor communication and gamecard (slot-1) registers, shared.
+    (0x04000180, "IPCSYNC", "IPC", "IPC Synchronize Register (Shared)"),
+    (0x04000184, "IPCFIFOCNT", "IPC", "IPC FIFO Control Register (Shared)"),
+    (0x04000188, "IPCFIFOSEND", "IPC", "IPC Send FIFO (Shared, Write-only by active CPU)"),
+    (0x040001A0, "AUXSPICNT", "Gamecard", "Gamecard ROM and SPI Bus Control (Shared)"), # Also SPI
+    (0x040001A2, "AUXSPIDATA", "Gamecard", "Gamecard SPI Bus Data/Strobe (Shared)"),    # Also SPI
+    (0x040001A4, "ROMCTRL", "Gamecard", "Gamecard Bus Timing/Control (Shared)"), # AKA CARDCTRL
+    (0x040001A8, "CARDCMD", "Gamecard", "Gamecard Bus Command Output (Shared, 8 bytes)"),
+    (0x040001B0, "CARD_SEED0_LO", "Gamecard", "Gamecard Encryption Seed 0 Lower 32bit (Shared)"),
+    (0x040001B4, "CARD_SEED1_LO", "Gamecard", "Gamecard Encryption Seed 1 Lower 32bit (Shared)"),
+    (0x040001B8, "CARD_SEED0_HI", "Gamecard", "Gamecard Encryption Seed 0 Upper 7bit (Shared)"),
+    (0x040001BA, "CARD_SEED1_HI", "Gamecard", "Gamecard Encryption Seed 1 Upper 7bit (Shared)"),
+
+    # - arm9 memory and interrupt control (0x04000204 - 0x04000249)
+    (0x04000204, "EXMEMCNT", "Memory Control", "External Memory Control (ARM9 Specific R/W, partially shared status)"),
+    (0x04000208, "IME_A9", "Interrupts", "Interrupt Master Enable (ARM9 Specific)"),
+    (0x04000210, "IE_A9", "Interrupts", "Interrupt Enable Register (ARM9 Specific)"),
+    (0x04000214, "IF_A9", "Interrupts", "Interrupt Request Flags (ARM9 Specific, R/W to clear)"),
+    (0x04000240, "VRAMCNT_A", "Memory Control", "VRAM Bank A (128KB) Control (ARM9 Specific Write)"),
+    (0x04000241, "VRAMCNT_B", "Memory Control", "VRAM Bank B (128KB) Control (ARM9 Specific Write)"),
+    (0x04000242, "VRAMCNT_C", "Memory Control", "VRAM Bank C (128KB) Control (ARM9 Specific Write)"),
+    (0x04000243, "VRAMCNT_D", "Memory Control", "VRAM Bank D (128KB) Control (ARM9 Specific Write)"),
+    (0x04000244, "VRAMCNT_E", "Memory Control", "VRAM Bank E (64KB) Control (ARM9 Specific Write)"),
+    (0x04000245, "VRAMCNT_F", "Memory Control", "VRAM Bank F (16KB) Control (ARM9 Specific Write)"),
+    (0x04000246, "VRAMCNT_G", "Memory Control", "VRAM Bank G (16KB) Control (ARM9 Specific Write)"),
+    (0x04000247, "WRAMCNT", "Memory Control", "Shared WRAM Bank Control (ARM9 Specific Write)"),
+    (0x04000248, "VRAMCNT_H", "Memory Control", "VRAM Bank H (32KB) Control (ARM9 Specific Write)"),
+    (0x04000249, "VRAMCNT_I", "Memory Control", "VRAM Bank I (16KB) Control (ARM9 Specific Write)"),
+
+    # - arm9 math hardware (0x04000280 - 0x040002bb)
+    # hardware division and square root units.
+    (0x04000280, "DIVCNT", "Math", "Division Control (ARM9 Specific)"),
+    (0x04000290, "DIV_NUMER", "Math", "Division Numerator (64-bit) (ARM9 Specific R/W)"),
+    (0x04000298, "DIV_DENOM", "Math", "Division Denominator (64-bit) (ARM9 Specific R/W)"),
+    (0x040002A0, "DIV_RESULT", "Math", "Division Quotient Result (64-bit) (ARM9 Specific Read)"),
+    (0x040002A8, "DIVREM_RESULT", "Math", "Division Remainder Result (64-bit) (ARM9 Specific Read)"),
+    (0x040002B0, "SQRTCNT", "Math", "Square Root Control (ARM9 Specific)"),
+    (0x040002B4, "SQRT_RESULT", "Math", "Square Root Result (32-bit) (ARM9 Specific Read)"),
+    (0x040002B8, "SQRT_PARAM", "Math", "Square Root Parameter Input (64-bit) (ARM9 Specific R/W)"),
+
+    # - arm9 system control (0x04000300 - 0x04000307)
+    (0x04000300, "POSTFLG_A9", "System", "POST Boot Flag (ARM9, Undocumented features)"),
+    (0x04000304, "POWCNT1", "Power", "Main Power Control Register (ARM9 Specific)"),
+
+    # - arm9 3d graphics engine (0x04000320 - 0x040006a3)
+    # this is a large block of registers for the 3d engine.
+    # only a few key registers are listed here as per the overview document.
+    (0x04000400, "GXFIFO", "3D Engine", "Geometry Command FIFO (ARM9)"),
+    (0x04000600, "GXSTAT", "3D Engine", "Geometry Engine Status (ARM9)"),
+
+    # - arm9 display engine b (sub screen: 0x04001000 - 0x0400106f)
+    # controls for the sub 2d graphics engine (engine b).
+    (0x04001000, "DISPCNT_B", "Display", "2D Engine B - LCD Control (ARM9)"),
+    # detailed registers for engine b (bg, affine, window, effects) follow a similar pattern to engine a.
+    (0x04001008, "BG0CNT_B", "Display", "2D Engine B - BG0 Control (ARM9)"),
+    (0x0400100A, "BG1CNT_B", "Display", "2D Engine B - BG1 Control (ARM9)"),
+    (0x0400100C, "BG2CNT_B", "Display", "2D Engine B - BG2 Control (ARM9)"),
+    (0x0400100E, "BG3CNT_B", "Display", "2D Engine B - BG3 Control (ARM9)"),
+    (0x04001010, "BG0HOFS_B", "Display", "2D Engine B - BG0 X-Offset (ARM9)"),
+    (0x04001012, "BG0VOFS_B", "Display", "2D Engine B - BG0 Y-Offset (ARM9)"),
+    (0x04001014, "BG1HOFS_B", "Display", "2D Engine B - BG1 X-Offset (ARM9)"),
+    (0x04001016, "BG1VOFS_B", "Display", "2D Engine B - BG1 Y-Offset (ARM9)"),
+    (0x04001018, "BG2HOFS_B", "Display", "2D Engine B - BG2 X-Offset (ARM9)"),
+    (0x0400101A, "BG2VOFS_B", "Display", "2D Engine B - BG2 Y-Offset (ARM9)"),
+    (0x0400101C, "BG3HOFS_B", "Display", "2D Engine B - BG3 X-Offset (ARM9)"),
+    (0x0400101E, "BG3VOFS_B", "Display", "2D Engine B - BG3 Y-Offset (ARM9)"),
+    (0x04001020, "BG2PA_B", "Display", "2D Engine B - BG2 Rotation/Scaling Parameter A (dx) (ARM9)"),
+    (0x04001022, "BG2PB_B", "Display", "2D Engine B - BG2 Rotation/Scaling Parameter B (dmx) (ARM9)"),
+    (0x04001024, "BG2PC_B", "Display", "2D Engine B - BG2 Rotation/Scaling Parameter C (dy) (ARM9)"),
+    (0x04001026, "BG2PD_B", "Display", "2D Engine B - BG2 Rotation/Scaling Parameter D (dmy) (ARM9)"),
+    (0x04001028, "BG2X_L_B", "Display", "2D Engine B - BG2 Reference Point X-Coordinate, Low (Internal) (ARM9)"),
+    (0x0400102A, "BG2X_H_B", "Display", "2D Engine B - BG2 Reference Point X-Coordinate, High (Internal) (ARM9)"),
+    (0x0400102C, "BG2Y_L_B", "Display", "2D Engine B - BG2 Reference Point Y-Coordinate, Low (Internal) (ARM9)"),
+    (0x0400102E, "BG2Y_H_B", "Display", "2D Engine B - BG2 Reference Point Y-Coordinate, High (Internal) (ARM9)"),
+    (0x04001030, "BG3PA_B", "Display", "2D Engine B - BG3 Rotation/Scaling Parameter A (dx) (ARM9)"),
+    (0x04001032, "BG3PB_B", "Display", "2D Engine B - BG3 Rotation/Scaling Parameter B (dmx) (ARM9)"),
+    (0x04001034, "BG3PC_B", "Display", "2D Engine B - BG3 Rotation/Scaling Parameter C (dy) (ARM9)"),
+    (0x04001036, "BG3PD_B", "Display", "2D Engine B - BG3 Rotation/Scaling Parameter D (dmy) (ARM9)"),
+    (0x04001038, "BG3X_L_B", "Display", "2D Engine B - BG3 Reference Point X-Coordinate, Low (Internal) (ARM9)"),
+    (0x0400103A, "BG3X_H_B", "Display", "2D Engine B - BG3 Reference Point X-Coordinate, High (Internal) (ARM9)"),
+    (0x0400103C, "BG3Y_L_B", "Display", "2D Engine B - BG3 Reference Point Y-Coordinate, Low (Internal) (ARM9)"),
+    (0x0400103E, "BG3Y_H_B", "Display", "2D Engine B - BG3 Reference Point Y-Coordinate, High (Internal) (ARM9)"),
+    (0x04001040, "WIN0H_B", "Display", "2D Engine B - Window 0 Horizontal Dimensions (ARM9)"),
+    (0x04001042, "WIN1H_B", "Display", "2D Engine B - Window 1 Horizontal Dimensions (ARM9)"),
+    (0x04001044, "WIN0V_B", "Display", "2D Engine B - Window 0 Vertical Dimensions (ARM9)"),
+    (0x04001046, "WIN1V_B", "Display", "2D Engine B - Window 1 Vertical Dimensions (ARM9)"),
+    (0x04001048, "WININ_B", "Display", "2D Engine B - Inside Window Control (ARM9)"),
+    (0x0400104A, "WINOUT_B", "Display", "2D Engine B - Outside Window and OBJ Window Control (ARM9)"),
+    (0x0400104C, "MOSAIC_B", "Display", "2D Engine B - Mosaic Size (ARM9)"),
+    (0x04001050, "BLDCNT_B", "Display", "2D Engine B - Blend Control (ARM9)"),
+    (0x04001052, "BLDALPHA_B", "Display", "2D Engine B - Blend Alpha Coefficients (ARM9)"),
+    (0x04001054, "BLDY_B", "Display", "2D Engine B - Blend Brightness (Fade) Coefficient (ARM9)"),
+    (0x0400106C, "MASTER_BRIGHT_B", "Display", "2D Engine B - Master Brightness (ARM9)"),
+
+    # - arm9 ipc receive and gamecard data in (0x04100000 - 0x04100013, shared region)
+    (0x04100000, "IPCFIFORECV", "IPC", "IPC Receive FIFO (Shared, Read-only by active CPU)"),
+    (0x04100010, "CARDDATA_RD", "Gamecard", "Gamecard Bus 4-byte Data In (Shared, Read-only)"),
+
+    # - arm7 i/o map
+    # these registers are primarily accessed or exclusively available to the arm7 processor,
+    # or have different behavior/meaning on arm7 compared to arm9 for shared addresses.
+
+    # shared registers like dispstat, vcount, dma, timers, keyinput, keycnt, ipc, gamecard control
+    # are already listed above. their addresses are the same for arm7.
+
+    # - arm7 debug and extended keypad (0x04000120 - 0x04000139)
+    (0x04000120, "SIODATA32_A7", "ARM7 Specific", "Debug SIO Data 32 (ARM7)"),
+    (0x04000128, "SIOCNT_A7", "ARM7 Specific", "Debug SIO Control (ARM7)"),
+    (0x04000134, "RCNT_A7", "ARM7 Specific", "Debug SIO Mode/General Purpose (RCNT) (ARM7)"),
+    (0x04000136, "EXTKEYIN", "Keypad", "Extended Key Input (Touchscreen, etc.) (ARM7 Read-only)"),
+    (0x04000138, "RTCCNT_A7", "RTC", "Real-Time Clock I/O (via SPI) (ARM7)"),
+
+    # - arm7 spi interface (0x040001c0 - 0x040001c3)
+    # for firmware, touchscreen, and power management.
+    (0x040001C0, "SPICNT_A7", "SPI", "SPI Bus Control (Firmware, Touch, Powerman) (ARM7 Specific)"),
+    (0x040001C2, "SPIDATA_A7", "SPI", "SPI Bus Data (ARM7 Specific)"),
+
+    # - arm7 memory, irq, and system control (0x04000204 - 0x0400030b)
+    (0x04000204, "EXMEMSTAT_A7", "Memory Control", "External Memory Status (ARM7 Read, reflects NDS9 EXMEMCNT bits 7-15)"),
+    (0x04000206, "WIFIWAITCNT_A7", "Wifi", "Wifi Wait State Control (ARM7 Specific)"),
+    (0x04000208, "IME_A7", "Interrupts", "Interrupt Master Enable (ARM7 Specific)"),
+    (0x04000210, "IE_A7", "Interrupts", "Interrupt Enable Register (ARM7 Specific)"),
+    (0x04000214, "IF_A7", "Interrupts", "Interrupt Request Flags (ARM7 Specific, R/W to clear)"),
+    # note: ie2 and if2 (0x4000218, 0x400021c) are dsi only.
+    (0x04000240, "VRAMSTAT_A7", "Memory Control", "VRAM C,D Bank Status (ARM7 Read-only)"),
+    (0x04000241, "WRAMSTAT_A7", "Memory Control", "Shared WRAM Bank Status (ARM7 Read-only)"),
+    (0x04000300, "POSTFLG_A7", "System", "POST Boot Flag (ARM7)"),
+    (0x04000301, "HALTCNT_A7", "Power", "Halt Control / Power Down (ARM7 Specific)"),
+    (0x04000304, "POWCNT2_A7", "Power", "Sound/Wifi Power Control (ARM7 Specific)"),
+    (0x04000308, "BIOSPROT_A7", "System", "BIOS Read Protection Address (ARM7 Specific)"),
+])
+# fmt: on
+
+# - arm7 sound registers (0x04000400 - 0x0400051f)
+# 16 sound channels, plus global sound controls and capture units.
+_sound_base = 0x04000400
+for _i in range(16):  # sound channels 0-15
+    _ch_base = _sound_base + _i * 0x10
+    # sound channel x control (16-bit + 16-bit unused)
+    NDS_IO_REGISTERS.append(
+        (
+            _ch_base + 0x0,
+            f"SOUND{_i}CNT",
+            "Sound",
+            f"Sound Channel {_i} Control (ARM7 Specific)",
+        )
+    )
+    # sound channel x source address (32-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _ch_base + 0x4,
+            f"SOUND{_i}SAD",
+            "Sound",
+            f"Sound Channel {_i} Data Source Address (ARM7 Specific Write)",
+        )
+    )
+    # sound channel x timer/reload (16-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _ch_base + 0x8,
+            f"SOUND{_i}TMR",
+            "Sound",
+            f"Sound Channel {_i} Timer/Reload Value (ARM7 Specific Write)",
+        )
+    )
+    # sound channel x loopstart point (16-bit)
+    NDS_IO_REGISTERS.append(
+        (
+            _ch_base + 0xA,
+            f"SOUND{_i}PNT",
+            "Sound",
+            f"Sound Channel {_i} Loop Start Point (ARM7 Specific Write)",
+        )
+    )
+    # sound channel x length in 32-bit words (20-bit relevant)
+    NDS_IO_REGISTERS.append(
+        (
+            _ch_base + 0xC,
+            f"SOUND{_i}LEN",
+            "Sound",
+            f"Sound Channel {_i} Length in DWords (ARM7 Specific Write)",
+        )
+    )
+
+# fmt: off
+NDS_IO_REGISTERS.extend([
+    (0x04000500, "SOUNDCNT", "Sound", "Global Sound Control (ARM7 Specific)"),
+    (0x04000504, "SOUNDBIAS", "Sound", "Sound Bias Setting (ARM7 Specific)"),
+    (0x04000508, "SNDCAP0CNT", "Sound", "Sound Capture 0 Control (ARM7 Specific)"),
+    (0x04000509, "SNDCAP1CNT", "Sound", "Sound Capture 1 Control (ARM7 Specific)"),
+    (0x04000510, "SNDCAP0DAD", "Sound", "Sound Capture 0 Destination Address (ARM7 Specific R/W)"),
+    (0x04000514, "SNDCAP0LEN", "Sound", "Sound Capture 0 Length (ARM7 Specific Write)"),
+    (0x04000518, "SNDCAP1DAD", "Sound", "Sound Capture 1 Destination Address (ARM7 Specific R/W)"),
+    (0x0400051C, "SNDCAP1LEN", "Sound", "Sound Capture 1 Length (ARM7 Specific Write)"),
+])
+# fmt: on
+
+# note: dsi-specific and debug-emulator specific registers from the document have been omitted
+# as the focus is on general nds hardware registers.
+# note: the granularity of 2d engine bg/window/affine registers is based on common gba layouts,
+# as the nds technical document often states "same registers as gba, some changed bits" for these blocks.
+# registers shared by both cpus are generally listed once under the arm9 section if primarily configured there,
+# or with a "(shared)" remark. arm7-specific views or functionalities for shared addresses are noted.
+
+# - nitro sdk constants
+# these constants relate to the _start_ModuleParams structure found in binaries compiled
+# with the official nintendo nitro sdk. this structure provides metadata about the binary,
+# including information about compression and memory layout.
+
+# magic bytes used to identify the _start_ModuleParams structure.
+NITRO_SDK_MODULE_PARAMS_MAGIC = (
+    b"\x21\x06\xc0\xde\xde\xc0\x06\x21"  # ASCII: "!\\x06\\xc0\\xde\\xde\\xc0\\x06!"
+)
+# size of the _start_ModuleParams structure in bytes.
+NITRO_SDK_MODULE_PARAMS_SIZE = 36
+# offset of the magic bytes within the _start_ModuleParams structure itself.
+NITRO_SDK_MODULE_PARAMS_MAGIC_OFFSET = 0x1C
 
 
+# - ndsview class definition
 class NDSView(BinaryView):
     """
-    binaryview class for loading and analyzing nintendo ds rom files.
+    BinaryView class for loading and analyzing Nintendo DS (NDS) ROM files.
+    It handles the NDS's dual-cpu architecture (ARM9 and ARM7), memory map,
+    overlays (dynamically loaded code segments), and hardware registers.
+    The loader relies on an external `nds_cartridge` reader module for
+    low-level parsing of the ROM format.
     """
 
-    name = "NDS"
-    long_name = "Nintendo DS ROM"
+    name = "NDS"  # short name for the view type, used by binary ninja internally.
+    long_name = "Nintendo DS ROM"  # descriptive name shown in the ui.
 
-    # --- segment permission flags ---
-    # combine basic permissions for common scenarios
-    RWX_FLAGS: SegmentFlag = (
+    # - segment permission flags
+    # common combinations for defining memory segment permissions.
+    # these are bitwise OR combinations of SegmentReadable (R), SegmentWritable (W), SegmentExecutable (X).
+    PERM_RWX: SegmentFlag = (
         SegmentFlag.SegmentReadable
         | SegmentFlag.SegmentWritable
         | SegmentFlag.SegmentExecutable
     )
-    RW_FLAGS: SegmentFlag = SegmentFlag.SegmentReadable | SegmentFlag.SegmentWritable
-    RX_FLAGS: SegmentFlag = SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable
-    R_FLAGS: SegmentFlag = SegmentFlag.SegmentReadable
+    PERM_RW: SegmentFlag = SegmentFlag.SegmentReadable | SegmentFlag.SegmentWritable
+    PERM_RX: SegmentFlag = SegmentFlag.SegmentReadable | SegmentFlag.SegmentExecutable
+    PERM_R: SegmentFlag = SegmentFlag.SegmentReadable
 
     def __init__(self, data: BinaryView):
         """
-        initializes the ndsview instance. minimal setup here.
+        initializes the NDSView instance.
+        this involves setting up the parent view (which provides the raw rom data),
+        a dedicated logger for this view, and configuring the architecture and
+        platform specific to the NDS console.
+
         args:
-            data: the binaryview object containing the raw nds rom data.
+            data: the BinaryView object containing the raw NDS ROM data.
+                  this is typically the 'Raw' view of the file provided by binary ninja.
         """
-        # --- initialize the base binaryview *first* ---
+        # initialize the base binaryview first, linking to the parent (raw) data source.
         BinaryView.__init__(self, file_metadata=data.file, parent_view=data)
 
-        # --- initialize instance variables *after* successful base init ---
-        self.raw: BinaryView = data  # keep a reference to the raw data view
-        self.log: Logger = self.create_logger("NDS")  # use "nds" logger name.
-        self._created_tag_types: Dict[str, TagType] = {}  # cache for created tagtypes.
-        self.nds_rom: Optional[NDSRom] = None  # store parsed rom data
+        # store a reference to the raw data view for direct access to the rom bytes.
+        self.raw_data: BinaryView = data
+        # create a logger instance specific to this plugin for organized and identifiable logging.
+        self.logger: Logger = self.create_logger(
+            f"BN.{self.name}"
+        )  # e.g., logger name "BN.NDS"
+        # cache for created tagtypes to avoid redundant api calls and improve performance during setup.
+        # keys are lowercase tag type names, values are the TagType objects.
+        self._created_tag_types: Dict[str, TagType] = {}
+        # store parsed rom data (header, binaries, overlays, etc.) from the NDSRomReader.
+        # this will be populated by _parse_rom_file_structure().
+        self.nds_rom_data: Optional[NDSRom] = None
+        # store the primary entry point address (typically ARM9's) once determined.
+        # this is used by perform_get_entry_point().
+        self._primary_entry_point_address: Optional[int] = None
 
-        # set architecture and platform (nds uses armv7 with thumb extensions)
+        # set architecture and platform. the nds features an arm946e-s (armv5te isa)
+        # and an arm7tdmi (armv4t isa). for binary ninja, "armv7" is often used as a
+        # versatile base architecture that supports the necessary instruction sets (arm and thumb)
+        # for analyzing both processors' code.
         try:
-            # arm9 is armv5te, arm7 is armv4t.
-            # use "armv7" as the closest available architecture in binary ninja
-            # that supports both arm and thumb instructions needed for arm9 analysis.
-            self.arch: Architecture = Architecture["armv7"]  # type: ignore
-            self.platform: Platform = self.arch.standalone_platform  # type: ignore
-            if not self.platform:
-                log_error(
-                    "[NDS] critical: could not get standalone platform for armv7."
+            # type ignore justification: architecture names are string literals used as keys.
+            self.arch: Optional[Architecture] = Architecture["armv7"]  # type: ignore
+            if not self.arch:
+                self.logger.log_error(
+                    "critical: 'armv7' architecture definition not found in binary ninja. NDS analysis requires it."
                 )
-                raise RuntimeError("failed to get armv7 platform.")
-            self.log.log_info(
-                f"using platform: {self.platform.name}, architecture: {self.arch.name}"
+                # this is a fatal error for the loader; it cannot proceed without a base architecture.
+                raise RuntimeError("'armv7' architecture definition not found.")
+
+            # get the standalone platform associated with the chosen architecture.
+            # this provides a basic execution environment context for analysis.
+            self.platform: Optional[Platform] = self.arch.standalone_platform
+            if not self.platform:
+                self.logger.log_error(
+                    f"critical: could not get standalone platform for architecture '{self.arch.name}'. NDS analysis cannot proceed."
+                )
+                # also a fatal error.
+                raise RuntimeError(
+                    f"failed to get standalone platform for {self.arch.name}."
+                )
+            self.logger.log_info(
+                f"using platform: {self.platform.name}, architecture: {self.arch.name} for NDS analysis."
             )
         except KeyError:
-            available_archs = [arch.name for arch in Architecture]  # type: ignore
-            log_error(
-                f"[NDS] critical: armv7 architecture not found. available: {available_archs}"
+            # this handles the specific case where "armv7" is not a recognized architecture key
+            # in the current binary ninja environment.
+            available_archs = [arch.name for arch in Architecture.list]  # type: ignore
+            self.logger.log_error(
+                f"critical: 'armv7' architecture key not found. available architectures: {available_archs}. NDS analysis requires 'armv7' or a compatible alternative."
             )
             raise RuntimeError(
-                f"required 'armv7' architecture not found in this binary ninja installation. available: {available_archs}"
+                f"required 'armv7' architecture not found. available: {available_archs}"
             )
         except Exception as e:
-            log_error(f"[NDS] critical error setting platform/arch: {e}")
-            raise
+            # catch any other unexpected errors during this critical setup phase.
+            self.logger.log_error(
+                f"critical error during NDSView architecture/platform setup: {e}\n{traceback.format_exc()}"
+            )
+            raise  # re-raise to ensure initialization fails clearly and binary ninja handles it.
 
     @classmethod
     def is_valid_for_data(cls, data: BinaryView) -> bool:
         """
-        checks if the data is likely an nds rom using a basic heuristic.
-        the full validation (crc checks) is deferred to the init method.
+        checks if the provided data is likely an nds rom.
+        this uses a basic heuristic: the presence of the nintendo logo magic bytes
+        (0x24, 0xff, 0xae, 0x51) at offset 0xc0 in the header.
+        full validation (e.g., crc checks by NDSRomReader) is deferred to the
+        `init` method for performance reasons, as `is_valid_for_data` might be
+        called frequently by binary ninja for many file types.
+
         args:
-            data: the binaryview object containing the data.
+            data: the BinaryView object containing the data to validate.
+
         returns:
-            true if the data is likely an nds rom, false otherwise.
+            true if the data appears to be an nds rom based on the magic bytes, false otherwise.
         """
         try:
-            # check for minimum header size needed for the logo magic
-            if data.length < 0xC4:
+            # minimum header size needed to check the nintendo logo magic.
+            # the logo itself starts at 0xc0; we need to read 4 bytes from there.
+            min_check_size = 0xC0 + 4
+            if data.length < min_check_size:
+                # log at debug level as this is a common scenario for non-nds files.
+                log_debug(
+                    f"[{cls.name}] validation: data length {data.length} is less than min check size {min_check_size}. not an nds rom."
+                )
                 return False
 
-            # check the first few bytes of the nintendo logo at 0xc0
-            logo_magic = data.read(0xC0, 4)
-            if logo_magic == b"\x24\xff\xae\x51":
-                log_info("[NDS] validation: found nintendo logo magic bytes.")
-                return True  # assume valid for now, full check in init()
+            # check the first few bytes of the nintendo logo at offset 0xc0.
+            # the expected magic is 0x51AEFF24 (stored little-endian as b"\\x24\\xff\\xae\\x51").
+            logo_magic_bytes = data.read(0xC0, 4)
+            expected_magic = b"\x24\xff\xae\x51"
+            if logo_magic_bytes == expected_magic:
+                # the magic bytes match; this is a strong indicator of an nds rom.
+                log_info(
+                    f"[{cls.name}] validation: found nintendo logo magic bytes at 0xC0. identified as potential nds rom."
+                )
+                return True
             else:
+                # the bytes at the magic offset do not match.
+                actual_magic_hex = (
+                    logo_magic_bytes.hex() if logo_magic_bytes else "N/A"
+                )  # provide hex for easier debugging
+                log_debug(
+                    f"[{cls.name}] validation: nintendo logo magic mismatch at 0xC0 (expected {expected_magic.hex()}, got 0x{actual_magic_hex}). not an nds rom."
+                )
                 return False
         except Exception as e:
+            # log an error if reading the bytes fails for any unexpected reason.
             log_error(
-                f"[NDS] error during basic validation check: {e}\n{traceback.format_exc()}"
+                f"[{cls.name}] validation: error during basic nds rom validation check: {e}\n{traceback.format_exc()}"
             )
             return False
 
-    # --- helper methods ---
+    # - helper methods for initialization
 
-    def _parse_rom_header(self) -> bool:
+    def _parse_rom_file_structure(self) -> bool:
         """
-        parses the nds rom header using ndsromreader.
-        performs full validation and stores the result in self.nds_rom.
-        returns true on success, false on failure.
+        parses the nds rom structure using the external `NDSRomReader` module.
+        this involves reading the entire rom into memory (a necessary step for
+        the current `NDSRomReader` implementation), performing full validation
+        (e.g., header crc checks), and populating `self.nds_rom_data` with the
+        parsed structures (header, arm9/arm7 binaries, fat, overlay tables).
+
+        returns:
+            true if the rom structure was successfully parsed and validated, false otherwise.
         """
-        self.log.log_info("reading entire rom into memory for header parsing...")
-        rom_length = self.raw.length
-        rom_data_bytes: bytes = self.raw.read(0, rom_length)
+        self.logger.log_info(
+            "reading entire rom into memory for full parsing and validation by NDSRomReader..."
+        )
+        rom_length = self.raw_data.length
+        if rom_length == 0:
+            self.logger.log_error("rom file is empty. cannot parse NDS structure.")
+            return False
+
+        # read the entire rom data. this can be memory-intensive for large roms.
+        # future improvements to NDSRomReader might allow stream-based parsing.
+        rom_data_bytes: Optional[bytes] = self.raw_data.read(0, rom_length)
         if not rom_data_bytes or len(rom_data_bytes) != rom_length:
-            self.log.log_error(
-                f"failed to read full rom data ({len(rom_data_bytes)} read vs {rom_length} expected) from parent view."
+            read_len = len(rom_data_bytes) if rom_data_bytes else 0
+            self.logger.log_error(
+                f"failed to read full rom data ({read_len} read vs {rom_length} expected) from parent view. NDS parsing aborted."
             )
             return False
 
-        self.log.log_info("performing full header validation...")
-        validation_size = min(0x1000, rom_length)
-        if not NDSRomReader.is_valid(rom_data_bytes[:validation_size]):
-            self.log.log_error(
-                "full header validation failed via ndsromreader.is_valid."
+        self.logger.log_info(
+            "performing full header and rom structure validation via NDSRomReader.is_valid()..."
+        )
+        # NDSRomReader.is_valid might perform crc checks or other deep validation.
+        # it might be more efficient to pass a slice for header validation if the reader supports it.
+        # for now, assuming it might need more context or the full data.
+        validation_check_size = min(
+            0x1000, rom_length
+        )  # e.g., first 4kb for header checks
+        if not NDSRomReader.is_valid(rom_data_bytes[:validation_check_size]):
+            self.logger.log_error(
+                "full rom validation failed via NDSRomReader.is_valid(). The ROM may be corrupted or not a standard NDS file."
             )
-            # if strict validation is needed, uncomment the next line:
-            # return False
+            # depending on strictness, one might return false here.
+            # for robustness, we'll proceed to attempt parsing but log this validation failure.
+            # return False # uncomment for strict validation enforcement.
         else:
-            self.log.log_info("full header validation successful.")
+            self.logger.log_info("NDSRomReader initial validation successful.")
 
-        self.log.log_info("parsing nds rom structure using ndsromreader...")
+        self.logger.log_info(
+            "parsing full NDS ROM structure using NDSRomReader.read()..."
+        )
         try:
-            self.nds_rom = NDSRomReader.read(rom_data_bytes)
+            # this is where the main parsing happens via the external reader.
+            self.nds_rom_data = NDSRomReader.read(rom_data_bytes)
         except Exception as e:
-            self.log.log_error(f"ndsromreader.read failed: {e}")
-            self.log.log_error(traceback.format_exc())
-            self.nds_rom = None  # ensure it's none on failure
+            self.logger.log_error(
+                f"NDSRomReader.read() encountered an unhandled exception: {e}"
+            )
+            self.logger.log_error(traceback.format_exc())
+            self.nds_rom_data = None  # ensure it's none on failure
+        finally:
+            # attempt to free the large rom_data_bytes buffer.
+            # this relies on the assumption that NDSRomReader copies necessary data
+            # or that the parsed structures no longer directly reference this buffer.
+            del rom_data_bytes
+            self.logger.log_debug(
+                "released in-memory copy of full rom data after NDSRomReader.read() attempt."
+            )
 
-        del rom_data_bytes  # free memory after parsing
-
-        if not self.nds_rom or not self.nds_rom.header:
-            self.log.log_error(
-                "failed to parse nds rom header and structures (ndsromreader.read returned none or header missing)."
+        if not self.nds_rom_data or not self.nds_rom_data.header:
+            self.logger.log_error(
+                "failed to parse NDS ROM structure: NDSRomReader.read() returned None, or the parsed header is missing."
             )
             return False
+
+        self.logger.log_info(
+            "successfully parsed NDS ROM file structure using NDSRomReader."
+        )
         return True
 
-    def _define_tag_types(self):
+    def _initialize_tag_types(self) -> None:
         """
-        defines and caches all necessary tag types used by this view.
-        iterates through the global nds_tag_types dictionary.
+        defines and caches all necessary tag types specific to NDS hardware and memory regions.
+        it iterates through the global `NDS_TAG_TYPE_DEFINITIONS` dictionary.
+        this ensures that tags can be applied with appropriate icons and names in the ui.
         """
-        self.log.log_info("defining nds hardware tag types...")
-        for name, icon in NDS_TAG_TYPES.items():
-            self._get_or_create_tag_type(name, icon)
+        self.logger.log_info("initializing NDS hardware and memory tag types...")
+        initialized_count = 0
+        for name, icon in NDS_TAG_TYPE_DEFINITIONS.items():
+            if self._get_or_create_tag_type(name, icon):
+                initialized_count += 1
+            else:
+                # warning if a specific tag type couldn't be set up.
+                self.logger.log_warn(
+                    f"could not initialize NDS tag type: '{name}' with icon '{icon}'."
+                )
+        self.logger.log_info(
+            f"{initialized_count}/{len(NDS_TAG_TYPE_DEFINITIONS)} NDS tag types are now ready."
+        )
 
     def _get_or_create_tag_type(self, name: str, icon: str) -> Optional[TagType]:
         """
-        gets or creates a tag type, caching the result. avoids redundant api calls.
+        retrieves an existing tag type by its name or creates a new one if it doesn't exist.
+        results are cached in `self._created_tag_types` to avoid redundant api calls
+        and improve performance during the loading process.
+        tag type names are handled case-insensitively for lookup by binary ninja,
+        but are created with the provided casing.
+
         args:
-            name: the name of the tag type (e.g., "memory region"). use proper case.
-            icon: the icon (emoji) for the tag type (e.g., "🗺️").
+            name: the name of the tag type (e.g., "Memory Region"). use proper case for creation.
+            icon: the icon (emoji or short string) for the tag type (e.g., "🗺️").
+
         returns:
-            the tagtype object or none if creation failed.
+            the TagType object if successfully found or created, or none if both attempts fail.
         """
+        # use lowercase for the internal cache key for consistent lookups.
         name_lower = name.lower()
         if name_lower in self._created_tag_types:
+            self.logger.log_debug(f"retrieved cached tag type: '{name}'.")
             return self._created_tag_types[name_lower]
 
-        if name_lower in self.tag_types:
-            tag_type = self.tag_types[name_lower]
-            if isinstance(tag_type, list):  # api can return list for some reason
-                tag_type = tag_type[0] if tag_type else None
-            if tag_type:
-                self.log.log_info(f"found existing tagtype '{name_lower}'.")
-                self._created_tag_types[name_lower] = tag_type
-                return tag_type
-            else:
-                self.log.log_error(
-                    f"tagtype '{name_lower}' exists but api returned empty list/none."
-                )
-                # proceed to creation block.
+        # attempt to get the tag type using binary ninja's built-in lookup (case-insensitive by name).
+        existing_tag_type = self.get_tag_type(name)
+        if existing_tag_type:
+            self.logger.log_debug(
+                f"found existing tag type in BinaryView: '{name}'. caching it."
+            )
+            self._created_tag_types[name_lower] = existing_tag_type
+            return existing_tag_type
 
+        # if the tag type does not exist in the view, create it.
         try:
-            self.log.log_info(f"creating new tagtype '{name}' with icon '{icon}'.")
-            tag_type = self.create_tag_type(name, icon)
-            self._created_tag_types[name_lower] = tag_type
-            return tag_type
+            # use the original (proper) casing for the name when creating the new tag type.
+            self.logger.log_info(f"creating new tag type: '{name}' with icon '{icon}'.")
+            new_tag_type = self.create_tag_type(name, icon)
+            self._created_tag_types[name_lower] = (
+                new_tag_type  # cache the newly created type
+            )
+            return new_tag_type
         except Exception as e:
-            self.log.log_error(f"failed to create tagtype '{name}': {e}")
+            # log an error if tag type creation fails for any reason.
+            self.logger.log_error(
+                f"failed to create tag type '{name}': {e}\n{traceback.format_exc()}"
+            )
             return None
 
-    def _define_reg_with_tag(
+    def _define_hardware_register(
         self,
         address: int,
-        name: str,
-        tag_type_name: str,
-        tag_type_icon: str,
-        description: str = "",
+        name: str,  # the symbol name for the register
+        tag_category_name: str,  # e.g., "Display", "Sound", must be a key in NDS_TAG_TYPE_DEFINITIONS
+        description: str = "",  # comment for the register
     ):
         """
-        helper to define a hardware register symbol and apply a descriptive tag.
+        helper method to define a symbol for a hardware register at a given address
+        and apply a descriptive tag to it for better organization in the ui.
+
+        args:
+            address: the memory address of the hardware register.
+            name: the name for the register symbol (e.g., "REG_DISPSTAT").
+            tag_category_name: the category name of the tag type (e.g., "Display").
+                               this must match a key in NDS_TAG_TYPE_DEFINITIONS.
+            description: an optional comment to add for the register at its address.
         """
         try:
+            # define the symbol for the register at its address.
+            # DataSymbol is appropriate for memory-mapped registers.
             self.define_auto_symbol(Symbol(SymbolType.DataSymbol, address, name))
+
+            # add the provided description as a comment at the register's address if not empty.
             if description:
                 self.set_comment_at(address, description)
-            tag_type = self._get_or_create_tag_type(tag_type_name, tag_type_icon)
+
+            # retrieve the icon associated with the tag category from our definitions.
+            # default to a generic hardware icon if the category is not found (should not happen with valid definitions).
+            tag_icon = NDS_TAG_TYPE_DEFINITIONS.get(
+                tag_category_name, "🔩"
+            )  # "🔩" is a generic gear/nut icon
+            tag_type = self._get_or_create_tag_type(tag_category_name, tag_icon)
+
+            # if the tag type was successfully obtained or created, add the tag to the register's address.
             if tag_type:
-                self.add_tag(address, tag_type, data=name)
+                # using the register name as tag data can be helpful for UI identification.
+                # self.add_tag expects the tag type's name (a string) as its second argument.
+                self.add_tag(address, tag_type.name, data=name)
+            else:
+                # this indicates an issue with tag type creation/retrieval.
+                self.logger.log_warn(
+                    f"could not obtain or create tag type '{tag_category_name}' for register '{name}' at 0x{address:08x}."
+                )
         except Exception as e:
-            self.log.log_error(
-                f"failed processing register '{name}' at 0x{address:x}: {e}"
+            # log any errors encountered during register definition, but continue loading other registers.
+            self.logger.log_error(
+                f"error processing hardware register '{name}' at 0x{address:08x}: {e}\n{traceback.format_exc()}"
             )
 
-    def _map_memory_regions(self):
-        """maps the core nds memory regions (ram, vram, io, etc.).
-        ram regions that can contain code are given minimal file backing for bndb function persistence.
+    def _map_memory_regions(self) -> None:
         """
-        self.log.log_info("mapping nds memory regions...")
+        maps the core NDS memory regions (RAM, VRAM, I/O, BIOS, TCMs).
+        RAM regions that can contain code (e.g., Main RAM, WRAM, TCMs, Overlays)
+        are given minimal file backing. This is a workaround to help Binary Ninja
+        persist functions defined in these RAM regions when saving a BNDB, as
+        non-file-backed RAM segments might otherwise lose such user-defined data.
+        The actual byte content for these minimal backings is insignificant as the
+        regions are RAM and will be populated by the NDS software at runtime.
+        """
+        self.logger.log_info("mapping NDS memory regions...")
 
-        def add_memory_region(
-            addr,
-            size,
-            perms,
-            name,
-            tag_name="Memory Region",
-            tag_icon="🗺️",
-            is_ram_for_code=False,
+        # internal helper function to simplify adding memory regions as segments.
+        def add_memory_segment(
+            address: int,  # starting virtual address of the segment
+            size: int,  # size of the segment in bytes
+            permissions: SegmentFlag,  # R/W/X permissions (e.g., self.PERM_RX)
+            name: str,  # descriptive name for the segment (e.g., "Main RAM")
+            tag_name: str = "Memory Region",  # category for the tag, defaults to "Memory Region"
+            is_ram_for_code: bool = False,  # if true, provide minimal file backing for bndb persistence
         ):
-            # helper to add a memory segment and associated metadata.
-            # addr: start address of the region.
-            # size: size of the region in bytes.
-            # perms: segment permissions (e.g., self.rx_flags).
-            # name: descriptive name for the region (e.g., "main ram").
-            # tag_name: name of the tag type to apply (e.g., "memory region").
-            # tag_icon: icon for the tag type.
-            # is_ram_for_code: boolean, if true, provides minimal file backing for bndb function persistence.
-
-            self.log.log_info(
-                f"  mapping {name}: addr=0x{addr:08x}, size=0x{size:x}, perms={perms}"
+            self.logger.log_debug(
+                f"  preparing to map '{name}': addr=0x{address:08x}, size=0x{size:06x} ({size // 1024}KB), perms={permissions}, ram_for_code={is_ram_for_code}"
             )
-
-            file_offset_for_backing = 0  # default for non-backed or i/o
-            file_length_for_backing = 0  # default for non-backed or i/o
-
+            file_offset_backing, file_length_backing = 0, 0
             if is_ram_for_code:
-                # provide minimal file backing for ram regions that might contain executable code.
-                # this helps bn save functions defined in these regions to the bndb.
-                # the actual byte read is insignificant as the region is ram or overwritten.
-                file_offset_for_backing = (
-                    0  # use a valid small offset from the start of the raw file
-                )
-                file_length_for_backing = (
-                    1  # must be non-zero to indicate "file-backed"
-                )
-
-                # sanity check against raw file length
-                if self.raw.length == 0:
-                    self.log.log_warn(
-                        f"raw file length is 0, cannot provide file backing for ram region {name}. mapping as non-backed."
+                # for ram regions intended to hold code (like overlays or main ram where code is loaded),
+                # providing a minimal, valid file backing helps binary ninja save functions defined there.
+                # the actual byte read from the file for this backing is not important, as it's ram.
+                if self.raw_data.length > 0:
+                    file_offset_backing = (
+                        0  # use a valid small offset from the start of the raw file.
                     )
-                    file_length_for_backing = 0  # fallback to non-backed
-                elif (
-                    file_offset_for_backing + file_length_for_backing > self.raw.length
-                ):
-                    self.log.log_warn(
-                        f"minimal file backing for ram region {name} (offset {file_offset_for_backing}, len {file_length_for_backing}) exceeds raw file length {self.raw.length}. mapping as non-backed."
+                    file_length_backing = (
+                        1  # must be non-zero to indicate "file-backed" to bn.
                     )
-                    file_length_for_backing = 0  # fallback to non-backed
+                    # sanity check the backing range against the raw file length.
+                    if file_offset_backing + file_length_backing > self.raw_data.length:
+                        self.logger.log_warn(
+                            f"  cannot provide file backing for RAM region '{name}' (offset {file_offset_backing}, len {file_length_backing}) as it exceeds raw file length {self.raw_data.length}. Mapping as non-backed RAM."
+                        )
+                        file_length_backing = (
+                            0  # fallback to non-backed if raw file is too small.
+                        )
+                else:  # raw file itself is empty.
+                    self.logger.log_warn(
+                        f"  raw file length is 0, cannot provide file backing for RAM region '{name}'. Mapping as non-backed RAM."
+                    )
+                    file_length_backing = 0
 
-            self.add_auto_segment(
-                addr, size, file_offset_for_backing, file_length_for_backing, perms
-            )
+            try:
+                # add the segment to the binary view.
+                self.add_auto_segment(
+                    address, size, file_offset_backing, file_length_backing, permissions
+                )
+                # get the appropriate tag type for this memory region.
+                tag_icon = NDS_TAG_TYPE_DEFINITIONS.get(
+                    tag_name, "🗺️"
+                )  # default map icon
+                tag_type = self._get_or_create_tag_type(tag_name, tag_icon)
+                if tag_type:
+                    # add a tag at the start of the region for easy identification in the ui.
+                    self.add_tag(
+                        address, tag_type.name, data=f"{name} Start"
+                    )  # use the tag type's string name.
+                # add a comment at the start of the region indicating its name and size.
+                self.set_comment_at(address, f"{name} ({size // 1024}KB)")
+                self.logger.log_info(f"  successfully mapped '{name}'.")
+            except Exception as e:
+                self.logger.log_error(
+                    f"failed to map memory region '{name}' at 0x{address:08x}: {e}\n{traceback.format_exc()}"
+                )
 
-            tag_type = self._get_or_create_tag_type(tag_name, tag_icon)
-            if tag_type:
-                self.add_tag(addr, tag_type, data=f"{name} Start")
-            self.set_comment_at(addr, f"{name} ({size // 1024}kb)")
-
-        # --- main memory regions (based on ds_technical_docs.txt) ---
-        # main ram: 4mb (standard), code can be loaded here (arm9, overlays)
-        add_memory_region(
-            0x02000000, 0x00400000, self.RWX_FLAGS, "Main RAM", is_ram_for_code=True
+        # - main memory regions (consult NDS technical documents like GBATEK for precise layout and usage)
+        # main ram: 4mb, general purpose, can contain code for arm9 (including overlays).
+        add_memory_segment(
+            0x02000000,
+            0x00400000,
+            self.PERM_RWX,
+            "Main RAM (4MB)",
+            is_ram_for_code=True,
         )
-
-        # shared wram: 32kb usable by arm9/arm7. can contain code.
-        # tech doc: "32k mappable to nds7 or nds9" from a total of 96kb wram.
-        # common mapping for arm9 is 0x03000000. arm7 often uses 0x037f8000 mirror.
-        add_memory_region(
+        # shared wram: 32kb block, accessible by both arm9 and arm7, can contain code.
+        add_memory_segment(
             0x03000000,
             0x00008000,
-            self.RWX_FLAGS,
+            self.PERM_RWX,
             "Shared WRAM (32KB Block)",
             is_ram_for_code=True,
         )
-        # self.add_auto_segment(0x037F8000, 0x00008000, 0,0, self.RWX_FLAGS) # this is an alias/mirror, map only one primary shared wram
-        # self.set_comment_at(0x037F8000, "Shared WRAM (ARM7 Mirror)")
-
-        # arm7 wram: 64kb, exclusive to arm7. can contain arm7 code.
-        add_memory_region(
+        # arm7 wram: 64kb, exclusive to arm7, can contain arm7 code.
+        add_memory_segment(
             0x03800000,
             0x00010000,
-            self.RWX_FLAGS,
+            self.PERM_RWX,
             "ARM7 WRAM (64KB)",
             is_ram_for_code=True,
         )
 
-        # --- i/o ports (not typically for general code execution, so no special backing) ---
-        # main i/o block for arm9/arm7 shared registers, and arm9 specific (engine a, math, etc.)
-        add_memory_region(
+        # - i/o ports (memory-mapped hardware registers)
+        add_memory_segment(
             0x04000000,
             0x00001000,
-            self.RW_FLAGS,
+            self.PERM_RW,
             "I/O Registers (Main Block, 0x4000xxx)",
             tag_name="Hardware Register",
-            tag_icon="🔩",
         )
-        # i/o for ipc receive fifo, gamecard data in (arm9/arm7)
-        add_memory_region(
+        add_memory_segment(
             0x04100000,
             0x00000020,
-            self.RW_FLAGS,
+            self.PERM_RW,
             "I/O Registers (IPC/Card Data, 0x4100xxx)",
             tag_name="Hardware Register",
-            tag_icon="🔩",
         )
-        # wifi i/o and ram block (arm7)
-        add_memory_region(
+        # wifi block includes i/o registers and 8kb of dedicated ram.
+        add_memory_segment(
             0x04800000,
             0x00008000,
-            self.RW_FLAGS,
-            "Wireless Comm (I/O & 8KB RAM@0x4804000)",
+            self.PERM_RW,
+            "Wireless Comm (I/O & 8KB RAM at 0x4804000)",
             tag_name="Wifi",
-            tag_icon="📡",
-        )  # covers ws0 32k region
+        )
 
-        # --- graphics memory (palette, vram, oam - not typically for direct program code execution) ---
-        add_memory_region(
-            0x05000000, 0x00000800, self.RW_FLAGS, "Standard Palette RAM (2KB)"
-        )  # corrected size
-        add_memory_region(
-            0x06000000, 0x000A4000, self.RW_FLAGS, "VRAM (Main Banks, 656KB Total)"
-        )  # covers all vram banks a-i
-        add_memory_region(
-            0x06800000, 0x000A4000, self.RW_FLAGS, "VRAM (LCDC Mapped Alias)"
-        )  # lcdc access to vram
-        add_memory_region(
-            0x07000000, 0x00000800, self.RW_FLAGS, "OAM - OBJ Attribute Memory (2KB)"
-        )  # corrected size
+        # - graphics memory (palette, vram, oam) - typically not for direct program code execution.
+        add_memory_segment(
+            0x05000000, 0x00000800, self.PERM_RW, "Standard Palette RAM (2KB)"
+        )
+        add_memory_segment(
+            0x06000000, 0x000A4000, self.PERM_RW, "VRAM (Main Banks A-I, 656KB Total)"
+        )
+        add_memory_segment(
+            0x06800000, 0x000A4000, self.PERM_RW, "VRAM (LCDC Mapped Alias)"
+        )  # an alias for accessing vram
+        add_memory_segment(
+            0x07000000, 0x00000800, self.PERM_RW, "OAM - OBJ Attribute Memory (2KB)"
+        )
 
-        # --- bios roms ---
-        # arm9 bios: 4kb used, mapped at 0xffff0000.
-        # tech doc says "32kb (only 3k used)" for arm9 bios, but also "4k nds9" in breakdown. using 4k.
-        add_memory_region(
+        # - bios roms (map as readable/executable, as they contain system code)
+        # arm9 bios: 4kb, mapped at 0xffff0000 from arm9's perspective.
+        add_memory_segment(
             0xFFFF0000,
             0x00001000,
-            self.RX_FLAGS,
+            self.PERM_RX,
             "ARM9 BIOS (4KB)",
             is_ram_for_code=True,
         )  # minimal backing if functions defined
-        # arm7 bios: 16kb, mapped at 0x00000000 (from arm7's perspective).
-        add_memory_region(
+        # arm7 bios: 16kb, mapped at 0x00000000 from arm7's perspective (physical 0).
+        add_memory_segment(
             0x00000000,
             0x00004000,
-            self.RX_FLAGS,
+            self.PERM_RX,
             "ARM7 BIOS (16KB at Physical 0x0)",
             is_ram_for_code=True,
-        )  # minimal backing
-
-        # --- tightly coupled memories (tcm) for arm9 ---
-        # arm9 itcm: 32kb code tcm. tech doc: "00000000h instruction tcm (32kb) ... mirror-able to 1000000h".
-        # common convention is to use the 0x01000000 mirror.
-        self.log.log_info(
-            "nds9 itcm is documented at 0x00000000 (32kb), mirrored to 0x01000000. mapping the 0x01000000 mirror."
         )
-        add_memory_region(
+
+        # - tightly coupled memories (tcms) for arm9 (fast on-chip ram)
+        # arm9 itcm (instruction tcm): 32kb, often mirrored from 0x00000000 to 0x01000000. we map the common mirror.
+        self.logger.log_info(
+            "ARM9 ITCM is documented at physical 0x00000000 (32KB), often mirrored to 0x01000000. Mapping the 0x01xxxxxx mirror."
+        )
+        add_memory_segment(
             0x01000000,
             0x00008000,
-            self.RWX_FLAGS,
+            self.PERM_RWX,
             "ARM9 ITCM (32KB Code, Mapped at 0x01xxxxxx)",
             is_ram_for_code=True,
         )
-
-        # arm9 dtcm: 16kb data tcm. base is movable. common default is 0x027c0000.
-        # tech doc: "0xxxx000h data tcm (16kb) (moveable)".
-        dtcm_common_base = 0x027C0000  # a common default, actual base can vary
-        self.log.log_info(
-            f"mapping arm9 dtcm at common default 0x{dtcm_common_base:x} (16kb). actual base is configurable."
+        # arm9 dtcm (data tcm): 16kb, base address is configurable by software. 0x027c0000 is a common default.
+        dtcm_base = 0x027C0000  # a common default base address for dtcm.
+        self.logger.log_info(
+            f"mapping ARM9 DTCM at common default base 0x{dtcm_base:08x} (16KB). Actual base is configurable by software via memory control registers."
         )
-        add_memory_region(
-            dtcm_common_base,
+        add_memory_segment(
+            dtcm_base,
             0x00004000,
-            self.RWX_FLAGS,
-            "ARM9 DTCM (16KB Data, Common Default)",
+            self.PERM_RWX,
+            "ARM9 DTCM (16KB Data, Common Default Base)",
             is_ram_for_code=True,
         )
 
-        # --- gba slot memory (not typically used by nds mode games, but part of memory map) ---
-        # self.log.log_info("gba slot rom/ram regions are part of the nds memory map but not mapped by default by this loader.")
-        # add_memory_region(0x08000000, 0x02000000, self.R_FLAGS, "GBA Slot ROM (Max 32MB)", is_ram_for_code=False) # typically read-only
-        # add_memory_region(0x0A000000, 0x00010000, self.RW_FLAGS, "GBA Slot RAM (Max 64KB)", is_ram_for_code=True)
+        self.logger.log_info("finished mapping NDS memory regions.")
 
     def _find_module_params(self, data: bytes) -> Optional[int]:
-        """searches for the nitro sdk _start_moduleparams magic bytes."""
+        """
+        searches for the Nitro SDK `_start_ModuleParams` magic bytes within the provided data.
+        this structure, if present, contains metadata about the binary's layout,
+        including information about compression and sizes, which can be more reliable
+        than the main NDS header for SDK-compiled binaries.
+
+        args:
+            data: bytes object (typically an ARM9 binary's raw data) to search within.
+
+        returns:
+            the starting offset of the `_start_ModuleParams` structure within `data` if
+            found and appears validly positioned, otherwise none.
+        """
         try:
             magic_index = data.find(NITRO_SDK_MODULE_PARAMS_MAGIC)
             if magic_index != -1:
+                # the magic bytes are at a fixed offset within the struct.
+                # calculate the potential start of the struct based on this.
                 struct_start_offset = magic_index - NITRO_SDK_MODULE_PARAMS_MAGIC_OFFSET
-                if (
-                    struct_start_offset >= 0
-                    and struct_start_offset + NITRO_SDK_MODULE_PARAMS_SIZE <= len(data)
+                # basic sanity check: does the calculated start offset and struct size fit within the data?
+                if 0 <= struct_start_offset and (
+                    struct_start_offset + NITRO_SDK_MODULE_PARAMS_SIZE <= len(data)
                 ):
-                    self.log.log_info(
-                        f"found _start_moduleparams structure at offset 0x{struct_start_offset:x} within arm9 data."
+                    self.logger.log_info(
+                        f"found _start_ModuleParams structure at offset 0x{struct_start_offset:x} within provided binary data."
                     )
                     return struct_start_offset
                 else:
-                    self.log.log_warn(
-                        f"found moduleparams magic at 0x{magic_index:x}, but calculated struct offset 0x{struct_start_offset:x} is invalid."
+                    self.logger.log_warn(
+                        f"found _start_ModuleParams magic at 0x{magic_index:x}, but calculated struct start offset 0x{struct_start_offset:x} is invalid for data length {len(data)}. Ignoring."
                     )
             else:
-                self.log.log_info(
-                    "_start_moduleparams magic not found. assuming non-sdk build or different structure."
+                # it's common for homebrew or non-sdk compiled binaries not to have this structure.
+                self.logger.log_info(
+                    "_start_ModuleParams magic not found. Assuming binary is not standard SDK build or uses a different layout mechanism."
                 )
         except Exception as e:
-            self.log.log_error(f"error searching for moduleparams: {e}")
+            # catch any unexpected errors during the search.
+            self.logger.log_error(
+                f"error occurred while searching for _start_ModuleParams: {e}\n{traceback.format_exc()}"
+            )
         return None
 
-    def _load_arm9(self):
-        """loads the main arm9 binary, handling decompression and bss."""
-        if not self.nds_rom or not self.nds_rom.header:
-            self.log.log_error("cannot load arm9, rom header not parsed.")
+    def _load_arm9_binary(self) -> None:
+        """
+        loads the main arm9 binary. this involves:
+        1. reading the raw arm9 binary data from the rom based on header offsets.
+        2. searching for and parsing the `_start_ModuleParams` structure (if present)
+           to determine compression status and accurate code/data sizes.
+        3. if compressed (typically mii lz77 variant), decompressing the data.
+        4. mapping the processed arm9 code/data into a memory segment with rx permissions.
+        5. mapping the arm9 bss (uninitialized data) segment with rw permissions.
+        6. creating corresponding sections for analysis.
+        """
+        if not self.nds_rom_data or not self.nds_rom_data.header:
+            self.logger.log_error(
+                "cannot load ARM9 binary, NDS ROM data/header not parsed or available."
+            )
             return
 
-        header = self.nds_rom.header
+        header = self.nds_rom_data.header
         if header.arm9_size == 0:
-            self.log.log_info("arm9 size is 0, skipping.")
+            self.logger.log_info("ARM9 size in header is 0, skipping ARM9 loading.")
             return
 
-        self.log.log_info("loading arm9 binary...")
-        arm9_data_raw: bytes = self.raw.read(header.arm9_rom_offset, header.arm9_size)
+        self.logger.log_info(
+            f"loading ARM9 binary: ROM offset=0x{header.arm9_rom_offset:x}, ROM size=0x{header.arm9_size:x}, Target RAM addr=0x{header.arm9_ram_address:x}"
+        )
+        arm9_data_raw: Optional[bytes] = self.raw_data.read(
+            header.arm9_rom_offset, header.arm9_size
+        )
         if not arm9_data_raw or len(arm9_data_raw) != header.arm9_size:
-            self.log.log_error(
-                f"failed to read full arm9 data from rom offset 0x{header.arm9_rom_offset:x} (read {len(arm9_data_raw)}, expected {header.arm9_size})"
+            read_len = len(arm9_data_raw) if arm9_data_raw else 0
+            self.logger.log_error(
+                f"failed to read full ARM9 binary data from ROM (read {read_len} bytes, expected {header.arm9_size} bytes). ARM9 loading aborted."
             )
             return
 
         load_address = header.arm9_ram_address
-        # effective_code_data_size is the size of the code/data segment in memory after any transformation
+        # effective_code_data_size is the size of the .text/.data segment in memory after any transformation (e.g. decompression).
         effective_code_data_size = 0
-        bss_size = header.arm9_bss_size
+        bss_size = header.arm9_bss_size  # from the main nds header.
 
-        is_compressed_according_to_moduleparams = False
-        module_params_found = False
-        sdk_derived_code_data_size = (
-            0  # expected decompressed size if moduleparams are used
-        )
+        # determine compression and actual code/data size, preferring _start_ModuleParams if available and valid.
+        is_compressed_via_moduleparams = False
+        module_params_struct_found = False
+        # sdk_derived_code_data_size is the expected size of code+data after decompression, according to _start_ModuleParams.
+        sdk_derived_code_data_size = 0
 
-        module_params_offset_in_raw = self._find_module_params(arm9_data_raw)
+        module_params_offset_in_raw_arm9 = self._find_module_params(arm9_data_raw)
 
-        if module_params_offset_in_raw is not None:
-            module_params_found = True
+        if module_params_offset_in_raw_arm9 is not None:
+            module_params_struct_found = True
             try:
-                auto_load_start = struct.unpack_from(
-                    "<I", arm9_data_raw, module_params_offset_in_raw + 8
+                # _start_moduleparams structure fields relevant for size and compression:
+                #   u32 autoLoadStartOffset; (offset 0) -> not directly used here, arm9_ram_address is the base
+                #   u32 autoLoadEndOffset;   (offset 4) -> size of code+data when loaded/decompressed
+                #   u32 bssStartOffset;      (offset 8) -> offset to bss start (relative to arm9_ram_address)
+                #   u32 bssEndOffset;        (offset 12) -> offset to bss end (relative to arm9_ram_address)
+                #   ...
+                #   u32 compressedEndOffset; (offset 20 / 0x14) -> non-zero if compressed
+                # all offsets are relative to the arm9_ram_address.
+                auto_load_end_offset_from_struct = struct.unpack_from(
+                    "<I", arm9_data_raw, module_params_offset_in_raw_arm9 + 4
                 )[0]
-                compressed_static_end = struct.unpack_from(
-                    "<I", arm9_data_raw, module_params_offset_in_raw + 20
+                compressed_static_end_marker = struct.unpack_from(
+                    "<I", arm9_data_raw, module_params_offset_in_raw_arm9 + 0x14
                 )[0]
-                is_compressed_according_to_moduleparams = compressed_static_end != 0
-                sdk_derived_code_data_size = auto_load_start - load_address
 
-                self.log.log_info(
-                    f"  moduleparams: compressed={is_compressed_according_to_moduleparams}, autoload_end=0x{auto_load_start:x}, sdk_code_data_size=0x{sdk_derived_code_data_size:x}"
+                is_compressed_via_moduleparams = compressed_static_end_marker != 0
+                # sdk_derived_code_data_size is the size from load_address to the end of the loaded/decompressed code/data section.
+                sdk_derived_code_data_size = (
+                    auto_load_end_offset_from_struct  # this value is the size itself.
                 )
-                if not (
-                    0 <= sdk_derived_code_data_size <= header.arm9_size * 20
-                ):  # sanity check (allow reasonable compression ratio)
-                    self.log.log_error(
-                        f"  moduleparams: invalid sdk_code_data_size (0x{sdk_derived_code_data_size:x}). will use header.arm9_size."
+
+                self.logger.log_info(
+                    f"  _start_ModuleParams parsed: compressed_marker=0x{compressed_static_end_marker:x} (is_compressed={is_compressed_via_moduleparams}), "
+                    f"auto_load_end_offset (derived_code_data_size)=0x{sdk_derived_code_data_size:x}"
+                )
+
+                # sanity check the derived size: must be non-negative and not excessively large.
+                # allow up to 20x compression ratio as a heuristic.
+                if not (0 <= sdk_derived_code_data_size <= header.arm9_size * 20):
+                    self.logger.log_error(
+                        f"  _start_ModuleParams: derived_code_data_size (0x{sdk_derived_code_data_size:x}) seems invalid. "
+                        f"Will revert to using header.arm9_size and assume uncompressed."
                     )
-                    sdk_derived_code_data_size = header.arm9_size
-                    is_compressed_according_to_moduleparams = False  # be cautious
-            except Exception as e:
-                self.log.log_error(
-                    f"error processing _start_moduleparams: {e}. using header.arm9_size."
+                    sdk_derived_code_data_size = header.arm9_size  # fallback
+                    is_compressed_via_moduleparams = (
+                        False  # be cautious, assume uncompressed
+                    )
+            except struct.error as se:  # error unpacking struct fields
+                self.logger.log_error(
+                    f"error unpacking _start_ModuleParams fields: {se}. Assuming uncompressed based on header.arm9_size."
                 )
-                module_params_found = False
+                module_params_struct_found = (
+                    False  # treat as if not found due to parsing error
+                )
                 sdk_derived_code_data_size = header.arm9_size
-                is_compressed_according_to_moduleparams = False
-        else:  # moduleparams not found
+                is_compressed_via_moduleparams = False
+            except Exception as e:  # catch any other unexpected errors
+                self.logger.log_error(
+                    f"unexpected error processing _start_ModuleParams: {e}. Assuming uncompressed based on header.arm9_size."
+                )
+                module_params_struct_found = False
+                sdk_derived_code_data_size = header.arm9_size
+                is_compressed_via_moduleparams = False
+        else:  # _start_ModuleParams magic not found
             sdk_derived_code_data_size = (
                 header.arm9_size
-            )  # default to raw size from header
-            is_compressed_according_to_moduleparams = False  # assume uncompressed
-            self.log.log_info(
-                "  _start_moduleparams not found. assuming arm9 is uncompressed or using header size."
+            )  # default to raw size from header for code/data
+            is_compressed_via_moduleparams = (
+                False  # assume uncompressed if no moduleparams
+            )
+            self.logger.log_info(
+                "  _start_ModuleParams not found. Assuming ARM9 is uncompressed or using header.arm9_size for .text/.data."
             )
 
-        arm9_was_actually_decompressed_and_valid = False
+        arm9_successfully_decompressed_and_written = False
 
-        if is_compressed_according_to_moduleparams:
-            self.log.log_info(
-                f"  attempting arm9 decompression (expected decompressed size: 0x{sdk_derived_code_data_size:x})..."
+        if is_compressed_via_moduleparams:
+            self.logger.log_info(
+                f"  attempting ARM9 Mii LZ77 decompression (expected decompressed size from moduleparams: 0x{sdk_derived_code_data_size:x})..."
             )
             try:
                 decompressed_data = self._mii_uncompress_backward(arm9_data_raw)
-                if decompressed_data:  # check if decompression yielded any data
+                if decompressed_data:
                     actual_decompressed_size = len(decompressed_data)
+                    # if moduleparams was found and gave a specific target size, compare against it.
                     if (
-                        module_params_found
+                        module_params_struct_found
                         and actual_decompressed_size != sdk_derived_code_data_size
+                        and sdk_derived_code_data_size != 0
                     ):
-                        self.log.log_warn(
-                            f"  actual decompressed arm9 size (0x{actual_decompressed_size:x}) != moduleparams expected (0x{sdk_derived_code_data_size:x}). using actual."
+                        self.logger.log_warn(
+                            f"  actual decompressed ARM9 size (0x{actual_decompressed_size:x}) differs from _start_ModuleParams expected size (0x{sdk_derived_code_data_size:x}). "
+                            "Using actual decompressed size for memory segment."
                         )
+                    effective_code_data_size = actual_decompressed_size  # use the size of what was actually decompressed.
 
-                    effective_code_data_size = actual_decompressed_size
-
-                    # segment definition points to original compressed data in the file,
-                    # but its memory size is the decompressed size.
-                    self.log.log_info(
-                        f"  adding segment for decompressed arm9: mem_addr=0x{load_address:08x}, mem_size=0x{effective_code_data_size:x}, file_offset=0x{header.arm9_rom_offset:x}, file_size=0x{header.arm9_size:x}"
+                    self.logger.log_info(
+                        f"  adding segment for decompressed ARM9: mem_addr=0x{load_address:08x}, mem_size=0x{effective_code_data_size:x}, "
+                        f"file_offset=0x{header.arm9_rom_offset:x} (original compressed file_size=0x{header.arm9_size:x})"
                     )
+                    # the segment maps the original compressed data from the file, but its size in memory is the decompressed size.
                     self.add_auto_segment(
                         load_address,
                         effective_code_data_size,  # memory address and size (decompressed)
                         header.arm9_rom_offset,
-                        header.arm9_size,  # file offset and size (original compressed)
-                        self.RX_FLAGS,
+                        header.arm9_size,  # file data is the original compressed block
+                        self.PERM_RX,  # code is readable and executable
                     )
 
-                    self.log.log_info(
-                        f"  writing {effective_code_data_size} bytes of decompressed arm9 data to 0x{load_address:08x}"
+                    self.logger.log_info(
+                        f"  writing {effective_code_data_size} bytes of decompressed ARM9 data to memory at 0x{load_address:08x}..."
                     )
                     bytes_written = self.write(load_address, decompressed_data)
                     if bytes_written != effective_code_data_size:
-                        self.log.log_error(
-                            f"arm9 write error (decompressed): expected {effective_code_data_size}, wrote {bytes_written}. segment may be corrupt."
+                        self.logger.log_error(
+                            f"ARM9 write error (decompressed data): expected to write {effective_code_data_size} bytes, but wrote {bytes_written}. Segment may be corrupted."
                         )
-                        # proceed with caution, segment might be partially written or incorrect
+                        # do not mark as successfully decompressed if write failed.
                     else:
-                        arm9_was_actually_decompressed_and_valid = (
-                            True  # successfully decompressed and written
+                        arm9_successfully_decompressed_and_written = True
+                        self.logger.log_info(
+                            f"  ARM9 decompression & write successful: {header.arm9_size} compressed bytes -> {effective_code_data_size} decompressed bytes."
                         )
-                else:
-                    self.log.log_warn(
-                        "arm9 decompression resulted in empty data. falling back to raw mapping."
+                else:  # mii_uncompress_backward returned empty data
+                    self.logger.log_warn(
+                        "ARM9 Mii decompression resulted in empty data. Effective code/data size will be 0. Falling back to raw mapping if applicable later."
+                    )
+                    effective_code_data_size = (
+                        0  # ensure this is zero if decompression yields nothing
                     )
             except Exception as e:
-                self.log.log_error(
-                    f"arm9 decompression raised an exception: {e}. falling back to raw mapping."
+                self.logger.log_error(
+                    f"ARM9 Mii decompression raised an exception: {e}. Effective code/data size will be 0. Falling back to raw mapping.\n{traceback.format_exc()}"
                 )
+                effective_code_data_size = 0  # ensure this on error too
 
-        # if not compressed, or if decompression was attempted but failed or yielded empty data
-        if not arm9_was_actually_decompressed_and_valid:
+        # handle cases where arm9 was not compressed, or decompression failed/yielded empty data.
+        if not arm9_successfully_decompressed_and_written:
             if (
-                is_compressed_according_to_moduleparams
-            ):  # implies decompression failed or was empty
-                self.log.log_warn(
-                    "  falling back to mapping raw arm9 data due to decompression issue."
+                is_compressed_via_moduleparams
+            ):  # implies decompression was attempted but failed or was empty
+                self.logger.log_warn(
+                    "  falling back to mapping raw (uncompressed) ARM9 data due to prior decompression issue."
                 )
             else:  # was not considered compressed in the first place
-                self.log.log_info("  arm9 mapping as raw/uncompressed data.")
+                self.logger.log_info(
+                    "  ARM9 mapping as raw/uncompressed data (no compression indicated or moduleparams absent)."
+                )
 
-            effective_code_data_size = header.arm9_size  # default to size in rom header
+            # determine the size of the code/data segment in memory.
+            # default to the size specified in the main NDS header (header.arm9_size).
+            effective_code_data_size = header.arm9_size
+            # determine how much data to map from the file.
             file_map_length = header.arm9_size
 
+            # if _start_ModuleParams was found and indicated uncompressed, and its derived size is valid and different,
+            # it might be more accurate for the memory layout than the main header's arm9_size.
             if (
-                module_params_found
-                and not is_compressed_according_to_moduleparams
+                module_params_struct_found
+                and not is_compressed_via_moduleparams
                 and sdk_derived_code_data_size > 0
             ):
                 if sdk_derived_code_data_size != header.arm9_size:
-                    self.log.log_warn(
-                        f"  moduleparams size 0x{sdk_derived_code_data_size:x} for uncompressed ARM9 differs from header size 0x{header.arm9_size:x}. Using moduleparams size for segment memory."
+                    self.logger.log_warn(
+                        f"  _start_ModuleParams size (0x{sdk_derived_code_data_size:x}) for uncompressed ARM9 differs from main header's arm9_size (0x{header.arm9_size:x}). "
+                        "Using _start_ModuleParams size for the memory segment size."
                     )
-                effective_code_data_size = sdk_derived_code_data_size  # memory size
-                file_map_length = min(
-                    sdk_derived_code_data_size, header.arm9_size
-                )  # but map from file based on smaller of the two
+                effective_code_data_size = (
+                    sdk_derived_code_data_size  # this is the intended size in memory.
+                )
+                # when mapping from file, map the smaller of the two to avoid reading past end of actual binary in file if moduleparams overestimates.
+                file_map_length = min(sdk_derived_code_data_size, header.arm9_size)
 
             if effective_code_data_size > 0:
-                self.log.log_info(
-                    f"  adding segment for raw arm9: mem_addr=0x{load_address:08x}, mem_size=0x{effective_code_data_size:x}, file_offset=0x{header.arm9_rom_offset:x}, file_size=0x{file_map_length:x}"
+                self.logger.log_info(
+                    f"  adding segment for raw ARM9: mem_addr=0x{load_address:08x}, mem_size=0x{effective_code_data_size:x}, "
+                    f"file_offset=0x{header.arm9_rom_offset:x}, file_map_len=0x{file_map_length:x}"
                 )
                 self.add_auto_segment(
                     load_address,
-                    effective_code_data_size,
+                    effective_code_data_size,  # size in memory
                     header.arm9_rom_offset,
-                    file_map_length,
-                    self.RX_FLAGS,
+                    file_map_length,  # data from file
+                    self.PERM_RX,
                 )
+            else:  # if effective_code_data_size ended up as 0 (e.g. header.arm9_size was 0 and no moduleparams)
+                self.logger.log_error(
+                    "  ARM9 effective_code_data_size is 0 for raw mapping. Cannot create code/data segment."
+                )
+                return  # cannot proceed without a code/data segment if bss is also 0.
+
+        # add a section for the loaded arm9 code/data to aid analysis.
+        if effective_code_data_size > 0:
+            self.add_auto_section(
+                name=".arm9.text_data",  # a more descriptive section name
+                start=load_address,
+                length=effective_code_data_size,
+                semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,  # arm9 code/data is typically read-only from rom/ram
+            )
+            # provide a comment indicating how this segment was loaded.
+            comment = "ARM9 Code/Data Segment"
+            if arm9_successfully_decompressed_and_written:
+                comment += " (Decompressed by Loader)"
+            elif module_params_struct_found and not is_compressed_via_moduleparams:
+                comment += " (SDK Raw, Uncompressed)"
+            elif is_compressed_via_moduleparams:
+                comment += " (Raw, Decompression Attempted but Failed/Empty)"  # implies it was expected to be compressed
             else:
-                self.log.log_error(
-                    "  arm9 effective_code_data_size is 0 for raw mapping. cannot create segment."
+                comment += " (Raw, Assumed Uncompressed)"
+            self.set_comment_at(load_address, comment)
+        else:  # this case should ideally be caught earlier if bss is also 0
+            self.logger.log_warn(
+                "ARM9 effective code/data size is zero, skipping section creation for .text_data."
+            )
+            if (
+                bss_size == 0
+            ):  # if no code/data and no bss, then arm9 is effectively empty
+                self.logger.log_warn(
+                    "ARM9 has no code/data and no BSS. ARM9 loading effectively skipped."
                 )
                 return
 
-        # add section for analysis
-        if effective_code_data_size > 0:
-            self.add_auto_section(
-                name=".arm9_code_data",
-                start=load_address,
-                length=effective_code_data_size,
-                semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,
-                type="Code",
-            )
-            comment = "arm9 code/data start"
-            if arm9_was_actually_decompressed_and_valid:
-                comment += " (decompressed)"
-            elif module_params_found and not is_compressed_according_to_moduleparams:
-                comment += " (sdk raw)"
-            elif is_compressed_according_to_moduleparams:
-                comment += " (raw, decompression failed/empty)"  # if it was supposed to be compressed but ended up raw
-            else:
-                comment += " (raw)"
-            self.set_comment_at(load_address, comment)
-        else:
-            self.log.log_warn(
-                "arm9 effective code/data size is zero, skipping section creation."
-            )
-            return
-
-        # handle arm9 bss
+        # handle arm9 bss (uninitialized data segment).
         if bss_size > 0:
-            bss_start_address = load_address + effective_code_data_size
-            self.log.log_info(
-                f"  mapping arm9 bss: addr=0x{bss_start_address:08x}, size=0x{bss_size:x}"
+            bss_start_address = (
+                load_address + effective_code_data_size
+            )  # bss typically follows the .text/.data segment.
+            self.logger.log_info(
+                f"  mapping ARM9 BSS: addr=0x{bss_start_address:08x}, size=0x{bss_size:x}"
             )
+            # bss is not file-backed, so file_offset and file_length are 0.
             self.add_auto_segment(
-                bss_start_address, bss_size, 0, 0, self.RW_FLAGS
-            )  # bss is not file-backed
+                bss_start_address, bss_size, 0, 0, self.PERM_RW
+            )  # bss is readable and writable.
             self.add_auto_section(
                 name=".arm9.bss",
                 start=bss_start_address,
                 length=bss_size,
-                semantics=SectionSemantics.ReadWriteDataSectionSemantics,
-                type="BSS",
+                semantics=SectionSemantics.ReadWriteDataSectionSemantics,  # standard bss semantics
             )
-            self.set_comment_at(bss_start_address, "arm9 bss start")
+            self.set_comment_at(
+                bss_start_address, "ARM9 BSS Segment Start (Uninitialized Data)"
+            )
         else:
-            self.log.log_info("  no arm9 bss section defined.")
+            self.logger.log_info(
+                "  no ARM9 BSS section defined in header (bss_size is 0)."
+            )
 
-        self.log.log_info(
-            f"arm9 loaded: entry=0x{header.arm9_entry_address:08x}, load=0x{load_address:08x}, "
-            f"code_data_size=0x{effective_code_data_size:x}, bss_size=0x{bss_size:x}, rom_offset=0x{header.arm9_rom_offset:08x}"
+        self.logger.log_info(
+            f"ARM9 binary processing complete: Entry Address=0x{header.arm9_entry_address:08x}, Load Address=0x{load_address:08x}, "
+            f"Code/Data Memory Size=0x{effective_code_data_size:x}, BSS Size=0x{bss_size:x}"
         )
 
-    def _load_arm7(self):
-        """loads the main arm7 binary and adds section. arm7 is typically not compressed."""
-        if not self.nds_rom or not self.nds_rom.header:
-            self.log.log_error("cannot load arm7, rom header not parsed.")
+    def _load_arm7_binary(self) -> None:
+        """
+        loads the main arm7 binary. arm7 binaries are typically not compressed in NDS ROMs.
+        this method maps the arm7 code/data from the rom into a memory segment
+        and also maps its bss (uninitialized data) segment. sections are created
+        for both to aid analysis.
+        """
+        if not self.nds_rom_data or not self.nds_rom_data.header:
+            self.logger.log_error(
+                "cannot load ARM7 binary, NDS ROM data/header not parsed or available."
+            )
             return
 
-        header = self.nds_rom.header
-        if header.arm7_size == 0:
-            self.log.log_info("arm7 size is 0, skipping loading.")
+        header = self.nds_rom_data.header
+        if header.arm7_size == 0:  # check if arm7 binary has any size.
+            self.logger.log_info("ARM7 size in header is 0, skipping ARM7 loading.")
             return
 
-        self.log.log_info("loading arm7 binary...")
+        self.logger.log_info(
+            f"loading ARM7 binary: ROM offset=0x{header.arm7_rom_offset:x}, ROM size=0x{header.arm7_size:x}, Target RAM addr=0x{header.arm7_ram_address:x}"
+        )
         load_address = header.arm7_ram_address
-        final_size = header.arm7_size  # size in rom and size in memory are the same
-        self.add_auto_segment(
-            load_address,
-            final_size,
-            header.arm7_rom_offset,  # file offset
-            final_size,  # file length
-            self.RX_FLAGS,
-        )
+        # for arm7, the size in rom is typically the size in memory (uncompressed).
+        code_data_size = header.arm7_size
 
-        self.add_auto_section(
-            name=".arm7",
-            start=load_address,
-            length=final_size,
-            semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,
-            type="Code",
-        )
-        self.set_comment_at(load_address, "arm7 binary start")
+        if code_data_size > 0:
+            # map the arm7 code/data segment directly from the rom.
+            self.add_auto_segment(
+                load_address,
+                code_data_size,  # memory address and size
+                header.arm7_rom_offset,
+                code_data_size,  # file offset and length match memory size
+                self.PERM_RX,  # arm7 code is readable and executable
+            )
+            # create a section for the arm7 code/data.
+            self.add_auto_section(
+                name=".arm7.text_data",  # section name indicating arm7 code/data
+                start=load_address,
+                length=code_data_size,
+                semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,  # typically read-only code
+            )
+            self.set_comment_at(load_address, "ARM7 Code/Data Segment Start")
+        else:  # this case should ideally be caught by the header.arm7_size == 0 check earlier.
+            self.logger.log_warn(
+                "ARM7 code/data size is zero, skipping segment and section creation for .text_data."
+            )
+            if (
+                header.arm7_bss_size == 0
+            ):  # if bss is also zero, then arm7 is effectively empty.
+                self.logger.log_warn(
+                    "ARM7 has no code/data and no BSS. ARM7 loading effectively skipped."
+                )
+                return
 
+        # handle arm7 bss (uninitialized data segment).
         arm7_bss_size = header.arm7_bss_size
         if arm7_bss_size > 0:
-            bss_start = load_address + final_size
-            self.log.log_info(
-                f"  mapping arm7 bss: addr=0x{bss_start:08x}, size=0x{arm7_bss_size:x}"
+            bss_start_address = (
+                load_address + code_data_size
+            )  # bss follows the .text/.data segment.
+            self.logger.log_info(
+                f"  mapping ARM7 BSS: addr=0x{bss_start_address:08x}, size=0x{arm7_bss_size:x}"
             )
+            # bss is not file-backed.
             self.add_auto_segment(
-                bss_start, arm7_bss_size, 0, 0, self.RW_FLAGS  # bss is not file-backed
-            )
+                bss_start_address, arm7_bss_size, 0, 0, self.PERM_RW
+            )  # bss is readable and writable.
             self.add_auto_section(
                 name=".arm7.bss",
-                start=bss_start,
+                start=bss_start_address,
                 length=arm7_bss_size,
-                semantics=SectionSemantics.ReadWriteDataSectionSemantics,
-                type="BSS",
+                semantics=SectionSemantics.ReadWriteDataSectionSemantics,  # standard bss semantics
             )
-            self.set_comment_at(bss_start, "arm7 bss start")
+            self.set_comment_at(
+                bss_start_address, "ARM7 BSS Segment Start (Uninitialized Data)"
+            )
+        else:
+            self.logger.log_info(
+                "  no ARM7 BSS section defined in header (bss_size is 0)."
+            )
 
-        self.log.log_info(
-            f"arm7 loaded: entry=0x{header.arm7_entry_address:08x}, load=0x{load_address:08x}, "
-            f"size=0x{final_size:x}, bss_size=0x{arm7_bss_size:x}, rom_offset=0x{header.arm7_rom_offset:08x} (raw mapped)"
+        self.logger.log_info(
+            f"ARM7 binary processing complete: Entry Address=0x{header.arm7_entry_address:08x}, Load Address=0x{load_address:08x}, "
+            f"Code/Data Size=0x{code_data_size:x}, BSS Size=0x{arm7_bss_size:x}"
         )
 
-    def _load_overlays(self, cpu_name: str, overlay_table: Optional[NDSOverlayTable]):
+    def _load_overlays_for_cpu(
+        self, cpu_name: str, overlay_table: Optional[NDSOverlayTable]
+    ) -> None:
         """
-        loads arm9 or arm7 overlays, handling decompression and adding segments/sections.
+        loads overlays for a specific cpu (arm9 or arm7). overlays are dynamically
+        loaded code/data segments. this method iterates through the overlay table,
+        reads the overlay data from the rom (via fat), handles decompression
+        (mii lz77 variant if indicated), maps the code/data and bss segments,
+        and creates corresponding sections.
+
+        args:
+            cpu_name: string identifier for the cpu ("ARM9" or "ARM7") for logging and naming.
+            overlay_table: the NDSOverlayTable object containing entries for this cpu's overlays.
         """
         if (
-            not self.nds_rom
-            or not self.nds_rom.fat_entries
+            not self.nds_rom_data
+            or not self.nds_rom_data.fat_entries
             or not overlay_table
             or not overlay_table.entries
         ):
-            self.log.log_info(
-                f"no {cpu_name} overlays found, fat missing, or overlay table missing."
+            self.logger.log_info(
+                f"no {cpu_name} overlays to load (ROM data, FAT, overlay table, or entries missing/empty)."
             )
             return
+        # the `is_compressed` attribute was added to NDSOverlayEntry in a later version of the nds_cartridge reader.
+        # this check ensures compatibility and provides a clear error if the reader is outdated.
         if not hasattr(NDSOverlayEntry, "is_compressed"):
-            self.log.log_error(
-                f"nds_cartridge.py NDSOverlayEntry is missing 'is_compressed' attribute. cannot load {cpu_name} overlays correctly."
+            self.logger.log_error(
+                f"The NDSOverlayEntry class from the `nds_cartridge.py` reader module is missing the "
+                f"'is_compressed' attribute. This loader cannot reliably determine if {cpu_name} overlays "
+                f"are compressed. Please update your NDS ROM reader module to a newer version."
             )
             return
 
-        self.log.log_info(f"loading {cpu_name} overlays...")
-        num_loaded = 0
-        num_failed = 0
-        for i, entry in enumerate(overlay_table.entries):
-            if entry.file_id == 0xFFFF:
-                continue  # skip placeholder
-            if entry.file_id >= len(self.nds_rom.fat_entries):
-                self.log.log_warn(
-                    f"skipping invalid {cpu_name} overlay {i}: file id {entry.file_id} out of fat bounds."
-                )
-                num_failed += 1
-                continue
-            if (
-                entry.ram_size == 0 and entry.bss_size == 0
-            ):  # entirely empty overlay entry
-                self.log.log_info(
-                    f"skipping empty {cpu_name} overlay {i} (file id {entry.file_id})."
-                )
-                continue
+        self.logger.log_info(
+            f"loading {cpu_name} overlays ({len(overlay_table.entries)} entries in table)..."
+        )
+        num_loaded_successfully = 0
+        num_failed_or_skipped = 0
 
-            fat_entry = self.nds_rom.fat_entries[entry.file_id]
+        for i, overlay_entry in enumerate(overlay_table.entries):
+            # file_id 0xffff (or other invalid values) is a common placeholder for an unused/empty overlay table entry.
+            if overlay_entry.file_id == 0xFFFF:  # standard "empty" marker
+                self.logger.log_debug(
+                    f"  skipping {cpu_name} overlay index {i}: placeholder entry (File ID 0xFFFF)."
+                )
+                continue
+            if overlay_entry.file_id >= len(self.nds_rom_data.fat_entries):
+                self.logger.log_warn(
+                    f"  skipping invalid {cpu_name} overlay index {i}: File ID {overlay_entry.file_id} "
+                    f"is out of FAT bounds (max index {len(self.nds_rom_data.fat_entries)-1}). Possible ROM corruption."
+                )
+                num_failed_or_skipped += 1
+                continue
+            # an overlay is considered effectively empty if both its RAM (code/data) and BSS sizes are zero.
+            if overlay_entry.ram_size == 0 and overlay_entry.bss_size == 0:
+                self.logger.log_info(
+                    f"  skipping empty {cpu_name} overlay index {i} (File ID {overlay_entry.file_id}): RAM and BSS sizes are both zero in overlay table entry."
+                )
+                continue  # no actual content to map for this overlay.
+
+            fat_entry = self.nds_rom_data.fat_entries[overlay_entry.file_id]
             overlay_size_in_rom = fat_entry.end_address - fat_entry.start_address
+            segment_name_base = f"{cpu_name}_Overlay{i}_FileID{overlay_entry.file_id}"  # more specific name
+            self.logger.log_debug(
+                f"  processing {segment_name_base}: ROM offset=0x{fat_entry.start_address:x}, ROM size=0x{overlay_size_in_rom:x}, "
+                f"Target RAM addr=0x{overlay_entry.ram_address:x}, Declared RAM size=0x{overlay_entry.ram_size:x}, "
+                f"BSS size=0x{overlay_entry.bss_size:x}, Compressed Flag={overlay_entry.is_compressed}"
+            )
 
-            overlay_data_raw = b""
-            if overlay_size_in_rom > 0:  # only read if fat entry indicates data
-                overlay_data_raw = self.raw.read(
+            overlay_data_from_rom: Optional[bytes] = None
+            # only attempt to read from rom if the fat indicates there's data for this file id.
+            if overlay_size_in_rom > 0:
+                overlay_data_from_rom = self.raw_data.read(
                     fat_entry.start_address, overlay_size_in_rom
                 )
-                if not overlay_data_raw or len(overlay_data_raw) != overlay_size_in_rom:
-                    self.log.log_error(
-                        f"failed to read {cpu_name} overlay {i} (file id {entry.file_id}) data from rom."
+                if (
+                    not overlay_data_from_rom
+                    or len(overlay_data_from_rom) != overlay_size_in_rom
+                ):
+                    read_len = (
+                        len(overlay_data_from_rom) if overlay_data_from_rom else 0
                     )
-                    num_failed += 1
+                    self.logger.log_error(
+                        f"failed to read {segment_name_base} data from ROM (read {read_len} bytes, expected {overlay_size_in_rom} bytes). Skipping this overlay."
+                    )
+                    num_failed_or_skipped += 1
                     continue
             elif (
-                entry.ram_size > 0
-            ):  # overlay expects ram content, but no corresponding data in rom (e.g. fully compressed to nothing, or error in rom)
-                self.log.log_warn(
-                    f"{cpu_name} overlay {i} (file_id {entry.file_id}) expects RAM content (size 0x{entry.ram_size:x}) but has no data in ROM (size 0x{overlay_size_in_rom:x}). Skipping code/data part."
+                overlay_entry.ram_size > 0
+            ):  # overlay table expects ram content, but fat says no data in rom.
+                self.logger.log_warn(
+                    f"{segment_name_base} expects RAM content (declared RAM size 0x{overlay_entry.ram_size:x}) "
+                    f"but has no corresponding data in ROM (FAT entry size is 0x{overlay_size_in_rom:x}). "
+                    f"The code/data part of this overlay will be empty."
                 )
-                # will proceed to bss if any, segment_ram_size_in_memory will be 0
+                # proceed to BSS handling, effective_ram_content_size will remain 0.
 
-            segment_ram_size_in_memory = 0  # actual size of code/data part in memory
-            load_address = entry.ram_address
-            segment_name_base = f"{cpu_name}_Overlay_{i}_File{entry.file_id}"
-            overlay_was_decompressed_and_valid = False
+            effective_ram_content_size = (
+                0  # this will be the actual size of the code/data part in memory.
+            )
+            load_address = overlay_entry.ram_address
+            overlay_successfully_processed_ram_part = (
+                False  # tracks if code/data was successfully mapped/written.
+            )
 
-            if entry.is_compressed:
-                if not overlay_data_raw:  # cannot decompress if no raw data was read
-                    self.log.log_error(
-                        f"cannot decompress {segment_name_base}: no raw data from rom (size_in_rom was {overlay_size_in_rom})."
+            if overlay_entry.is_compressed:
+                if (
+                    not overlay_data_from_rom
+                ):  # cannot decompress if no raw data was read (e.g., rom_size was 0).
+                    self.logger.log_error(
+                        f"cannot decompress {segment_name_base}: no raw data available from ROM (ROM size in FAT was {overlay_size_in_rom})."
                     )
-                    # if ram_size > 0, this is an issue. if ram_size is 0, it might be a pure bss overlay marked compressed.
                     if (
-                        entry.ram_size > 0
-                    ):  # if it expected content, this is a failure for the code part
-                        num_failed += 1
+                        overlay_entry.ram_size > 0
+                    ):  # if it expected content, this is a failure for the code/data part.
+                        num_failed_or_skipped += 1
                         continue
-                    # if ram_size is 0, proceed to bss handling
-                else:  # have raw data to decompress
-                    self.log.log_info(
-                        f"  decompressing {segment_name_base} (rom size: 0x{overlay_size_in_rom:x}, expected ram size: 0x{entry.ram_size:x})..."
+                    # if ram_size is 0, it might be a pure bss overlay incorrectly marked compressed; proceed to bss handling.
+                else:  # have raw data, attempt decompression.
+                    self.logger.log_info(
+                        f"  decompressing {segment_name_base} (ROM size: 0x{overlay_size_in_rom:x}, declared target RAM size: 0x{overlay_entry.ram_size:x})..."
                     )
                     try:
                         decompressed_data = self._mii_uncompress_backward(
-                            overlay_data_raw
+                            overlay_data_from_rom
                         )
-                        if decompressed_data:  # check if decompression yielded any data
-                            segment_ram_size_in_memory = len(decompressed_data)
+                        if decompressed_data:
+                            effective_ram_content_size = len(decompressed_data)
+                            # compare actual decompressed size with the size declared in the overlay table.
+                            # overlay_entry.ram_size is the authoritative expected size after decompression.
                             if (
-                                segment_ram_size_in_memory != entry.ram_size
-                                and entry.ram_size != 0
-                            ):  # entry.ram_size is the target decompressed size
-                                self.log.log_warn(
-                                    f"  {segment_name_base}: actual decompressed size (0x{segment_ram_size_in_memory:x}) != table RAM size (0x{entry.ram_size:x}). using actual."
+                                effective_ram_content_size != overlay_entry.ram_size
+                                and overlay_entry.ram_size != 0
+                            ):
+                                self.logger.log_warn(
+                                    f"  {segment_name_base}: actual decompressed size (0x{effective_ram_content_size:x}) "
+                                    f"differs from overlay table's declared RAM size (0x{overlay_entry.ram_size:x}). "
+                                    "Using actual decompressed size for memory segment, but this might indicate an issue."
+                                )
+                            elif (
+                                overlay_entry.ram_size == 0
+                                and effective_ram_content_size > 0
+                            ):
+                                self.logger.log_warn(
+                                    f"  {segment_name_base}: overlay table declared RAM size 0 but decompression yielded 0x{effective_ram_content_size:x} bytes. Using actual decompressed size."
                                 )
 
-                            # segment definition points to original compressed data, memory size is decompressed size
-                            self.log.log_info(
-                                f"  adding segment for decompressed overlay {segment_name_base}: mem_addr=0x{load_address:08x}, mem_size=0x{segment_ram_size_in_memory:x}, file_offset=0x{fat_entry.start_address:x}, file_size=0x{overlay_size_in_rom:x}"
-                            )
+                            # map the original compressed data from file, but the segment's memory size is the decompressed size.
                             self.add_auto_segment(
                                 load_address,
-                                segment_ram_size_in_memory,  # memory address and size (decompressed)
+                                effective_ram_content_size,
                                 fat_entry.start_address,
-                                overlay_size_in_rom,  # file offset and size (original compressed)
-                                self.RX_FLAGS,
+                                overlay_size_in_rom,
+                                self.PERM_RX,
                             )
+                            # write the decompressed data into the newly created memory segment.
                             bytes_written = self.write(load_address, decompressed_data)
-                            if bytes_written != segment_ram_size_in_memory:
-                                self.log.log_error(
-                                    f"overlay {segment_name_base} write error (decompressed): expected {segment_ram_size_in_memory}, wrote {bytes_written}"
+                            if bytes_written == effective_ram_content_size:
+                                overlay_successfully_processed_ram_part = True
+                                self.logger.log_info(
+                                    f"  {segment_name_base} decompression & write successful: {overlay_size_in_rom} bytes -> {effective_ram_content_size} bytes."
                                 )
-                                # segment might be corrupted, do not mark as valid decompressed
                             else:
-                                overlay_was_decompressed_and_valid = True
-                                self.log.log_info(
-                                    f"  decompression & write successful: {overlay_size_in_rom} bytes -> {segment_ram_size_in_memory} bytes"
+                                self.logger.log_error(
+                                    f"  {segment_name_base} write error (decompressed): expected to write {effective_ram_content_size} bytes, but wrote {bytes_written}. Overlay may be corrupt."
                                 )
-                        else:  # decompression resulted in empty data
-                            self.log.log_warn(
-                                f"  decompression of {segment_name_base} resulted in empty data. overlay code/data part will be empty."
+                        else:  # mii_uncompress_backward returned empty data.
+                            self.logger.log_warn(
+                                f"  decompression of {segment_name_base} resulted in empty data. Code/data part will be effectively empty."
                             )
-                            segment_ram_size_in_memory = 0  # ensure it's zero
+                            effective_ram_content_size = 0  # ensure this is zero if decompression yields nothing.
                     except Exception as e:
-                        self.log.log_error(
-                            f"failed to decompress {segment_name_base}: {e}. overlay code/data part will be empty."
+                        self.logger.log_error(
+                            f"failed to decompress {segment_name_base}: {e}. Code/data part will be effectively empty.\n{traceback.format_exc()}"
                         )
-                        segment_ram_size_in_memory = 0  # ensure it's zero
-
-            # if not compressed, or if decompression was attempted but failed/was empty
-            if (
-                not overlay_was_decompressed_and_valid and not entry.is_compressed
-            ):  # only map raw if it was never meant to be compressed
-                segment_ram_size_in_memory = (
-                    overlay_size_in_rom  # use raw size from rom
+                        effective_ram_content_size = 0  # ensure this on error too.
+            elif (
+                overlay_data_from_rom
+            ):  # not compressed, and there is raw data from rom.
+                effective_ram_content_size = (
+                    overlay_size_in_rom  # use raw size from rom.
                 )
+                # it's good practice to compare with overlay_entry.ram_size here too.
                 if (
-                    segment_ram_size_in_memory > 0
-                ):  # only map if there's actual data in rom
-                    self.log.log_info(
-                        f"  adding segment for raw overlay {segment_name_base}: mem_addr=0x{load_address:08x}, size=0x{segment_ram_size_in_memory:x}, file_offset=0x{fat_entry.start_address:x}"
+                    effective_ram_content_size != overlay_entry.ram_size
+                    and overlay_entry.ram_size != 0
+                ):
+                    self.logger.log_warn(
+                        f"  {segment_name_base} (uncompressed): ROM file size (0x{effective_ram_content_size:x}) "
+                        f"differs from overlay table's declared RAM size (0x{overlay_entry.ram_size:x}). "
+                        "Using ROM file size for mapping, but this might indicate an issue."
                     )
-                    self.add_auto_segment(
-                        load_address,
-                        segment_ram_size_in_memory,
-                        fat_entry.start_address,
-                        segment_ram_size_in_memory,
-                        self.RX_FLAGS,
+                elif (
+                    overlay_entry.ram_size == 0 and effective_ram_content_size > 0
+                ):  # table says 0, but file has data
+                    self.logger.log_warn(
+                        f"  {segment_name_base} (uncompressed): overlay table declared RAM size 0 but ROM file has 0x{effective_ram_content_size:x} bytes. Using ROM file size."
                     )
-                # if segment_ram_size_in_memory is 0 here, it means overlay_size_in_rom was 0.
-                # if entry.ram_size was > 0, it was logged as a warning earlier.
 
-            # add section for the code/data part
-            if segment_ram_size_in_memory > 0:
-                self.add_auto_section(
-                    f".{segment_name_base}",
+                # map the raw data directly.
+                self.add_auto_segment(
                     load_address,
-                    segment_ram_size_in_memory,
-                    SectionSemantics.ReadOnlyCodeSectionSemantics,
-                    "OverlayCode",
+                    effective_ram_content_size,
+                    fat_entry.start_address,
+                    effective_ram_content_size,
+                    self.PERM_RX,
+                )
+                overlay_successfully_processed_ram_part = (
+                    True  # considered processed if mapped.
+                )
+                self.logger.log_info(
+                    f"  {segment_name_base} mapped as raw (uncompressed) data: size 0x{effective_ram_content_size:x}."
+                )
+
+            # add a section for the code/data part of the overlay if it was successfully processed and has content.
+            if (
+                effective_ram_content_size > 0
+                and overlay_successfully_processed_ram_part
+            ):
+                self.add_auto_section(
+                    name=f".overlay.{segment_name_base}",  # unique section name
+                    start=load_address,
+                    length=effective_ram_content_size,
+                    semantics=SectionSemantics.ReadOnlyCodeSectionSemantics,  # overlays are typically code/rodata
                 )
                 self.set_comment_at(
                     load_address,
-                    f"{segment_name_base} start{' (decompressed)' if overlay_was_decompressed_and_valid else ' (raw)'}",
+                    f"{segment_name_base} Code/Data Start{' (Decompressed by Loader)' if overlay_entry.is_compressed else ' (Raw from ROM)'}",
                 )
             elif (
-                entry.ram_size > 0
-            ):  # expected ram content but segment_ram_size_in_memory is 0 (e.g. decompression yielded empty or raw was empty)
-                self.log.log_warn(
-                    f"  {segment_name_base} expected RAM size 0x{entry.ram_size:x} but no valid data was mapped for sectioning."
+                overlay_entry.ram_size > 0
+                and not overlay_successfully_processed_ram_part
+            ):  # expected ram content but didn't get it mapped.
+                self.logger.log_warn(
+                    f"  {segment_name_base} expected RAM content (declared size 0x{overlay_entry.ram_size:x}) but no valid data was mapped for sectioning. No code/data section created."
                 )
 
-            # add bss segment
-            if entry.bss_size > 0:
-                bss_start_address = (
-                    load_address + segment_ram_size_in_memory
-                )  # bss follows actual code/data
-                self.log.log_info(
-                    f"  mapping {segment_name_base} bss: addr=0x{bss_start_address:08x}, size=0x{entry.bss_size:x}"
+            # add bss segment for the overlay if defined.
+            if overlay_entry.bss_size > 0:
+                # bss follows the actual code/data content in memory.
+                bss_start_address = load_address + effective_ram_content_size
+                self.logger.log_info(
+                    f"  mapping {segment_name_base} BSS: addr=0x{bss_start_address:08x}, size=0x{overlay_entry.bss_size:x}"
                 )
                 self.add_auto_segment(
-                    bss_start_address, entry.bss_size, 0, 0, self.RW_FLAGS
-                )  # bss not file backed
+                    bss_start_address, overlay_entry.bss_size, 0, 0, self.PERM_RW
+                )  # bss is not file-backed.
                 self.add_auto_section(
-                    f".{segment_name_base}.bss",
-                    bss_start_address,
-                    entry.bss_size,
-                    SectionSemantics.ReadWriteDataSectionSemantics,
-                    "OverlayBSS",
+                    name=f".overlay.{segment_name_base}.bss",  # unique bss section name
+                    start=bss_start_address,
+                    length=overlay_entry.bss_size,
+                    semantics=SectionSemantics.ReadWriteDataSectionSemantics,
                 )
-                self.set_comment_at(bss_start_address, f"{segment_name_base} bss start")
+                self.set_comment_at(
+                    bss_start_address,
+                    f"{segment_name_base} BSS Start (Uninitialized Data)",
+                )
 
-            # define static initializer function symbol (analysis will create the function)
-            if entry.static_initializer_start_address != 0:
-                init_start = entry.static_initializer_start_address
-                func_addr = init_start & ~1
-                is_thumb = (init_start & 1) != 0
-                # check if initializer is within the loaded code/data part of this overlay
-                if segment_ram_size_in_memory > 0 and (
-                    load_address
-                    <= func_addr
-                    < load_address + segment_ram_size_in_memory
+            # define a symbol for the static initializer function, if specified.
+            if overlay_entry.static_initializer_start_address != 0:
+                init_addr_raw = overlay_entry.static_initializer_start_address
+                init_func_addr = (
+                    init_addr_raw & ~1
+                )  # align to 2 bytes for arm/thumb instruction sets.
+                # check if the initializer address falls within the loaded code/data part of this overlay.
+                if (
+                    effective_ram_content_size > 0
+                    and overlay_successfully_processed_ram_part
+                    and (
+                        load_address
+                        <= init_func_addr
+                        < load_address + effective_ram_content_size
+                    )
                 ):
-                    self.log.log_info(
-                        f"  defining symbol for {segment_name_base} static initializer at 0x{func_addr:x} {'(thumb implied)' if is_thumb else ''}"
+                    self.logger.log_info(
+                        f"  defining symbol for {segment_name_base} static initializer at 0x{init_func_addr:x} (raw entry: 0x{init_addr_raw:x})."
                     )
                     self.define_auto_symbol(
                         Symbol(
                             SymbolType.FunctionSymbol,
-                            func_addr,
+                            init_func_addr,
                             f"{segment_name_base}_Init",
                         )
                     )
                     self.set_comment_at(
-                        func_addr,
-                        f"{segment_name_base} static initializer (entry point)",
+                        init_func_addr,
+                        f"{segment_name_base} Static Initializer Entry Point",
                     )
-                    # self.add_entry_point(func_addr) # consider if overlay initializers are true "entry points" for analysis
+                    # self.add_function(init_func_addr) # let analysis discover it to handle arm/thumb state correctly.
                 else:
-                    self.log.log_warn(
-                        f"  {segment_name_base} static initializer 0x{init_start:x} is outside its loaded/valid RAM region (start 0x{load_address:x}, size 0x{segment_ram_size_in_memory:x}). skipping symbol definition."
+                    self.logger.log_warn(
+                        f"  {segment_name_base} static initializer address 0x{init_addr_raw:x} (aligned 0x{init_func_addr:x}) "
+                        f"is outside its loaded/valid RAM region (0x{load_address:x} - 0x{load_address + effective_ram_content_size -1 :x}). Skipping symbol definition."
                     )
-            num_loaded += 1
+            num_loaded_successfully += 1
 
-        log_func = self.log.log_info if num_failed == 0 else self.log.log_warn
-        log_func(
-            f"loaded {num_loaded} / {len(overlay_table.entries)} {cpu_name} overlays ({num_failed} failures)."
+        # log summary of overlay loading.
+        log_summary_func = (
+            self.logger.log_info if num_failed_or_skipped == 0 else self.logger.log_warn
+        )
+        log_summary_func(
+            f"finished loading {cpu_name} overlays: {num_loaded_successfully} entries processed, {num_failed_or_skipped} failed or skipped."
         )
 
     def _mii_uncompress_backward(self, data: bytes) -> bytes:
         """
-        decompresses data using mii lz77 variant (backward).
-        raises valueerror or eoferror on failure.
+        decompresses data using the Mii LZ77 variant (backward decompression).
+        this is a common compression format for NDS overlays and ARM9 binaries.
+        the algorithm reads control flags and data from the end of the compressed
+        stream and writes to the end of the destination buffer, working backwards.
+
+        args:
+            data: the compressed byte string.
+
+        returns:
+            a bytes object containing the decompressed data.
+
+        raises:
+            ValueError: if the data is malformed (e.g., too short, invalid size, unsupported type).
+            EOFError: if the compressed data ends prematurely during decompression.
+            IndexError: if there's an out-of-bounds access during decompression (indicates corruption).
         """
-        if len(data) < 4:  # minimum for footer
-            raise ValueError("data too short for mii decompression footer")
-
-        footer = data[-4:]
-        decompressed_size = struct.unpack_from("<I", footer, 0)[0]
-
-        if decompressed_size == 0 and len(data) == 4:
-            return b""  # just a footer indicating zero size
-        if (
-            decompressed_size == 0 and len(data) > 4
-        ):  # non-empty data but zero size in footer
-            self.log.log_warn(
-                "mii footer indicates zero decompressed size but data is present."
-            )
-            # this case is ambiguous. for now, let's assume it might be an error or uncompressed.
-
-        # check for header if data is long enough
-        if (
-            len(data) < 8
-        ):  # need at least footer (4 bytes) and header (4 bytes) for type 1
-            # if only footer, and size is non-zero, it might be uncompressed data with a size footer
-            if decompressed_size == len(data) - 4:
-                self.log.log_info(
-                    "mii data seems uncompressed (size matches data minus footer)."
-                )
-                return data[:-4]
-            # if decompressed_size is 0 here, means it's an empty payload from just footer
-            if decompressed_size == 0:
-                return b""
+        if len(data) < 4:  # minimum for footer (which contains the decompressed size)
             raise ValueError(
-                f"data too short for mii header (len {len(data)}) but decompressed_size is {decompressed_size}"
+                "data too short for Mii decompression footer (minimum 4 bytes required)."
             )
 
-        header_val = struct.unpack_from("<I", data, len(data) - 8)[0]
-        comp_type = (header_val >> 24) & 0xF  # usually 0x1 for lz77 variant
+        # the last 4 bytes of the compressed data form a footer containing the decompressed size (little-endian u32).
+        decompressed_size = struct.unpack_from("<I", data, len(data) - 4)[0]
+        self.logger.log_debug(
+            f"Mii Decompress: Expected decompressed size from footer: 0x{decompressed_size:x}"
+        )
 
-        if (
-            decompressed_size == 0
-        ):  # if truly zero from footer, and we have header+footer
-            if (
-                comp_type == 0x1 and header_val == 0x10000000
-            ):  # common for empty compressed block
-                return b""
-            # if decompressed_size is 0 but header is not the empty block marker, it's ambiguous
-            self.log.log_warn(
-                f"mii decompressed_size is 0, but header is 0x{header_val:x}. Assuming empty based on size."
+        if decompressed_size == 0:  # if target size is 0, the result is empty.
+            self.logger.log_debug(
+                "Mii Decompress: Decompressed size is 0, returning empty data."
             )
             return b""
 
-        if (
-            decompressed_size > 0x10000000
-        ):  # sanity check size (256mb), nds max ram is 4mb. overlays are smaller.
+        # for compressed data, there's typically a 4-byte compression header *before* the 4-byte decompressed_size footer.
+        # so, minimum length for actual compressed data is 8 bytes.
+        if len(data) < 8:
+            # if data is short (4-7 bytes) but `decompressed_size` matches `len(data)-4`,
+            # it might be uncompressed data with just a size footer.
+            if decompressed_size == len(data) - 4:
+                self.logger.log_info(
+                    "Mii Decompress: Data seems uncompressed (length matches data minus footer). Returning raw data (excluding footer)."
+                )
+                return data[:-4]
+            # otherwise, it's malformed if it's too short for a header but expects non-zero decompressed output.
             raise ValueError(
-                f"invalid mii decompressed size: 0x{decompressed_size:x} (too large)"
+                f"data too short for Mii header (length {len(data)}) but decompressed_size is {decompressed_size}. Malformed data."
             )
 
-        if comp_type != 0x1:  # common nds lz77 type is 0x1_
-            self.log.log_warn(
-                f"mii compression type {comp_type} encountered, not type 1 (lz77). treating as uncompressed (returning raw data minus footer)."
+        # the compression header is the 4 bytes immediately preceding the decompressed_size footer.
+        header_val = struct.unpack_from("<I", data, len(data) - 8)[0]
+        comp_type = (
+            header_val >> 24
+        ) & 0xF  # compression type is in the top 4 bits of this header word.
+
+        # type 0x1 (or 0x10 when shifted) is the common LZ77 variant used in NDS.
+        if comp_type != 0x1:
+            self.logger.log_warn(
+                f"Mii compression type is {comp_type}, not the expected type 1 (LZ77 variant). "
+                f"Attempting to treat as uncompressed (returning raw data minus 4-byte footer as a fallback)."
             )
-            return data[:-4]  # fallback, might be incorrect
-
-        result = bytearray(decompressed_size)
-        dst_offs = decompressed_size
-        src_offs = len(data) - 8  # start reading before the 8-byte header/footer block
-
-        while dst_offs > 0:
-            if src_offs <= 0:
-                raise EOFError(
-                    f"mii source data exhausted unexpectedly (dst_offs={dst_offs}, src_offs={src_offs})"
+            # this is a fallback. if it's truly a different compression algorithm, this will produce incorrect data.
+            # if decompressed_size matches len(data)-4, it's more likely to be uncompressed.
+            if decompressed_size == len(data) - 4:
+                return data[:-4]
+            else:  # sizes don't match for uncompressed fallback, this is likely an error or an unsupported type.
+                raise ValueError(
+                    f"unsupported Mii compression type {comp_type} and size mismatch for uncompressed fallback strategy."
                 )
 
-            block_header = data[src_offs - 1]
-            src_offs -= 1
-
-            for _ in range(8):  # process 8 blocks/literals
-                if dst_offs <= 0:
-                    break  # finished decompression mid-header
-
-                if (block_header & 0x80) == 0:  # literal byte
-                    if src_offs <= 0:
-                        raise EOFError(
-                            f"mii source exhausted (literal byte) (dst_offs={dst_offs}, src_offs={src_offs})"
-                        )
-                    literal_byte = data[src_offs - 1]
-                    src_offs -= 1
-                    dst_offs -= 1
-                    if (
-                        dst_offs < 0
-                    ):  # should not happen if decompressed_size was correct
-                        raise IndexError(
-                            "mii destination offset became negative (literal)"
-                        )
-                    result[dst_offs] = literal_byte
-                else:  # lz77 copy block
-                    if src_offs <= 1:  # need 2 bytes for lz77 params
-                        raise EOFError(
-                            f"mii source exhausted (lz77 block header) (dst_offs={dst_offs}, src_offs={src_offs})"
-                        )
-                    byte1 = data[src_offs - 1]
-                    byte2 = data[src_offs - 2]
-                    src_offs -= 2
-
-                    length = ((byte1 & 0xF0) >> 4) + 3
-                    disp = (((byte1 & 0x0F) << 8) | byte2) + 1
-
-                    if dst_offs < length:  # not enough space left to write
-                        raise ValueError(
-                            f"mii lz77 copy length ({length}) exceeds remaining destination space ({dst_offs}). possible corrupt data or incorrect decompressed_size."
-                        )
-
-                    try:
-                        for _ in range(length):
-                            current_write_idx = dst_offs - 1
-                            current_read_idx = current_write_idx + disp
-                            if not (
-                                0 <= current_read_idx < decompressed_size
-                                and 0 <= current_write_idx < decompressed_size
-                            ):
-                                raise IndexError(
-                                    f"mii lz77 copy out of bounds: read_idx={current_read_idx}, write_idx={current_write_idx}, disp={disp}, len={length}, dst_rem={dst_offs}"
-                                )
-                            result[current_write_idx] = result[current_read_idx]
-                            dst_offs -= 1
-                    except IndexError as ie:
-                        raise IndexError(
-                            f"mii lz77 copy error: {ie} (length={length}, disp={disp}, current_dst_offs_before_iter_copy={dst_offs+length}, read_idx_attempt={current_read_idx}, write_idx_attempt={current_write_idx})"
-                        )
-
-                block_header = (block_header << 1) & 0xFF
-                if dst_offs <= 0 and _ < 7:  # check after each bit processed
-                    break
-
-        if dst_offs != 0:
-            self.log.log_warn(
-                f"mii decompression finished, but dst_offs is non-zero ({dst_offs}). result may be truncated or padded if original size was incorrect."
+        # sanity check on decompressed_size to prevent attempts to allocate excessive memory.
+        # NDS typically has 4MB main RAM. Overlays are usually much smaller.
+        # a very large decompressed_size (e.g., > 32MB) is highly suspicious and likely indicates corruption.
+        if (
+            decompressed_size > 0x2000000
+        ):  # 32 MB limit, adjust if necessary for specific use cases.
+            raise ValueError(
+                f"invalid Mii decompressed_size: 0x{decompressed_size:x} (exceeds sanity limit of 32MB). Possible data corruption."
             )
-        return bytes(result)
 
-    def _define_io_registers(self):
-        """defines symbols and tags for known nds i/o registers."""
-        self.log.log_info("defining nds hardware symbols and tags...")
-        for addr, name, tag_name, desc in NDS_IO_REGISTERS:
-            icon = NDS_TAG_TYPES.get(tag_name, "🔩")
-            self._define_reg_with_tag(addr, name, tag_name, icon, desc)
+        result_buffer = bytearray(decompressed_size)
+        dest_ptr = decompressed_size  # current position in destination buffer (writing backwards from end).
+        src_ptr = (
+            len(data) - 8
+        )  # current position in source buffer (reading backwards from before header/footer).
 
-    def _define_entry_points(self):
-        """defines entry points and start symbols for arm9 and arm7.
-        functions themselves will be created by analysis.
+        while dest_ptr > 0:  # continue until destination buffer is filled.
+            if (
+                src_ptr <= 0
+            ):  # ran out of source data before filling destination buffer.
+                raise EOFError(
+                    f"Mii source data exhausted prematurely (dest_ptr={dest_ptr}, src_ptr={src_ptr}). Decompressed data may be incomplete or corrupted."
+                )
+
+            block_flags = data[
+                src_ptr - 1
+            ]  # read the 8-bit flag block. each bit controls one operation.
+            src_ptr -= 1
+
+            for bit_idx in range(8):  # process 8 blocks/literals based on the flags.
+                if dest_ptr <= 0:
+                    break  # finished decompression if destination buffer is full.
+
+                if (
+                    block_flags & 0x80
+                ) == 0:  # if the highest bit of block_flags is 0, it's a literal byte.
+                    if src_ptr <= 0:
+                        raise EOFError(
+                            f"Mii source exhausted while expecting a literal byte (dest_ptr={dest_ptr}, src_ptr={src_ptr})."
+                        )
+                    literal_byte = data[src_ptr - 1]
+                    src_ptr -= 1
+                    dest_ptr -= 1  # move destination pointer back.
+                    if dest_ptr < 0:
+                        raise IndexError(
+                            "Mii destination pointer became negative during literal byte write (should not happen)."
+                        )
+                    result_buffer[dest_ptr] = literal_byte
+                else:  # if the highest bit is 1, it's an LZ77 copy block (length/displacement pair).
+                    if src_ptr <= 1:
+                        raise EOFError(
+                            f"Mii source exhausted while expecting LZ77 block parameters (dest_ptr={dest_ptr}, src_ptr={src_ptr})."
+                        )
+                    byte1 = data[src_ptr - 1]
+                    byte2 = data[src_ptr - 2]
+                    src_ptr -= 2
+
+                    # decode length and displacement from the two bytes.
+                    # length: 4 bits (from byte1 high nibble) + 3 (minimum copy length is 3).
+                    # displacement: 12 bits (byte1 low nibble + byte2) + 1 (displacement is 1-based).
+                    copy_length = ((byte1 & 0xF0) >> 4) + 3
+                    copy_disp = (((byte1 & 0x0F) << 8) | byte2) + 1
+
+                    if (
+                        dest_ptr < copy_length
+                    ):  # check if there's enough space left in destination for this copy.
+                        raise ValueError(
+                            f"Mii LZ77 copy length ({copy_length}) exceeds remaining destination space ({dest_ptr}). "
+                            f"Possible corrupt data or incorrect decompressed_size in footer."
+                        )
+
+                    # perform the copy from already decompressed part of the buffer.
+                    for _ in range(copy_length):
+                        current_write_idx = dest_ptr - 1
+                        # source for copy is relative to current_write_idx + displacement (looking "back" in the output).
+                        current_read_idx = current_write_idx + copy_disp
+                        # sanity check bounds for both read and write indices.
+                        if not (
+                            0 <= current_read_idx < decompressed_size
+                            and 0 <= current_write_idx < decompressed_size
+                        ):
+                            raise IndexError(
+                                f"Mii LZ77 copy operation out of bounds: read_idx={current_read_idx}, write_idx={current_write_idx}, "
+                                f"disp={copy_disp}, len={copy_length}, dest_rem={dest_ptr}, total_size={decompressed_size}"
+                            )
+                        result_buffer[current_write_idx] = result_buffer[
+                            current_read_idx
+                        ]
+                        dest_ptr -= (
+                            1  # move destination pointer back for each byte copied.
+                        )
+
+                block_flags = (
+                    block_flags << 1
+                ) & 0xFF  # shift to process the next flag bit.
+                if dest_ptr <= 0 and bit_idx < 7:
+                    break  # check if done after each bit, not just after 8 bits.
+
+        if (
+            dest_ptr != 0
+        ):  # if dest_ptr is not 0, the output buffer wasn't perfectly filled.
+            self.logger.log_warn(
+                f"Mii decompression finished, but destination pointer is non-zero ({dest_ptr}). "
+                f"This means the actual decompressed data size did not exactly match the 'decompressed_size' from the footer. "
+                f"The result may be truncated or contain uninitialized padding if the original size was incorrect."
+            )
+        return bytes(result_buffer)
+
+    def _define_all_io_registers(self) -> None:
         """
-        if not self.nds_rom or not self.nds_rom.header:
-            self.log.log_error("cannot define entry points, rom header not parsed.")
+        defines symbols and tags for known NDS I/O registers.
+        the actual list `NDS_IO_REGISTERS` is currently empty as per user request,
+        so this method will log that and do nothing if the list is empty.
+        """
+        self.logger.log_info(
+            "defining NDS hardware symbols and tags for I/O registers..."
+        )
+        if not NDS_IO_REGISTERS:  # check if the list has been populated.
+            self.logger.log_info(
+                "  NDS_IO_REGISTERS list is currently empty. No NDS-specific I/O registers will be defined at this time."
+            )
             return
 
-        header = self.nds_rom.header
+        defined_count = 0
+        for addr, name, tag_name, desc in NDS_IO_REGISTERS:
+            self.logger.log_debug(
+                f"  defining I/O register: {name} at 0x{addr:08x} (Category: {tag_name})"
+            )
+            self._define_hardware_register(addr, name, tag_name, desc)
+            defined_count += 1
+        self.logger.log_info(
+            f"defined {defined_count}/{len(NDS_IO_REGISTERS)} NDS I/O registers from the list."
+        )
 
-        # arm9 entry point
+    def _define_entry_points_and_symbols(self) -> None:
+        """
+        defines entry points and corresponding `_start9` and `_start7` symbols
+        for the ARM9 and ARM7 processors based on information from the NDS header.
+        actual function creation at these addresses is deferred to Binary Ninja's
+        standard analysis passes, which will correctly handle ARM/Thumb mode.
+        """
+        if not self.nds_rom_data or not self.nds_rom_data.header:
+            self.logger.log_error(
+                "cannot define NDS entry points, NDS ROM data/header not parsed or available."
+            )
+            return
+
+        header = self.nds_rom_data.header
+        primary_entry_defined_successfully = False
+
+        # define arm9 entry point and symbol.
         arm9_load_addr = header.arm9_ram_address
-        entry_point_arm9 = header.arm9_entry_address
-        func_addr_aligned_arm9 = (
-            entry_point_arm9 & ~1
-        )  # address for function must be word aligned
-        is_thumb_arm9 = (entry_point_arm9 & 1) != 0  # lsb indicates thumb mode
+        arm9_entry_raw = (
+            header.arm9_entry_address
+        )  # this address may have LSB set for Thumb mode.
+        arm9_entry_aligned = (
+            arm9_entry_raw & ~1
+        )  # actual function address must be word-aligned.
+        # is_thumb_arm9 = (arm9_entry_raw & 1) != 0 # LSB=1 indicates Thumb mode.
 
-        segment_at_arm9_entry = self.get_segment_at(func_addr_aligned_arm9)
-        # check if the entry point is within a valid, executable segment that was loaded at the expected arm9 ram address
+        segment_at_arm9_entry = self.get_segment_at(arm9_entry_aligned)
+        # ensure the entry point falls within a valid, executable segment that was loaded at the expected arm9 ram address.
         if (
             segment_at_arm9_entry
             and segment_at_arm9_entry.start == arm9_load_addr
             and segment_at_arm9_entry.executable
         ):
-            self.log.log_info(
-                f"defining arm9 entry point symbol: _start9 at 0x{func_addr_aligned_arm9:08x}{', thumb implied' if is_thumb_arm9 else ''}"
+            self.logger.log_info(
+                f"defining ARM9 entry point and symbol: _start9 at 0x{arm9_entry_aligned:08x} (raw entry from header: 0x{arm9_entry_raw:x})."
             )
-            self.add_entry_point(func_addr_aligned_arm9)
+            self.add_entry_point(arm9_entry_aligned)
             self.define_auto_symbol(
-                Symbol(SymbolType.FunctionSymbol, func_addr_aligned_arm9, "_start9")
+                Symbol(SymbolType.FunctionSymbol, arm9_entry_aligned, "_start9")
             )
-            # self.add_function(func_addr_aligned_arm9) # removed: let analysis create it
+            self._primary_entry_point_address = (
+                arm9_entry_aligned  # arm9 is typically the primary processor.
+            )
+            primary_entry_defined_successfully = True
         else:
-            self.log.log_warn(
-                f"arm9 entry point 0x{func_addr_aligned_arm9:x} not in a valid executable segment starting at expected load address 0x{arm9_load_addr:x}. "
-                f"segment found: {segment_at_arm9_entry}. _start9 symbol/entry point may not be effective."
+            self.logger.log_warn(
+                f"ARM9 entry point 0x{arm9_entry_aligned:x} (raw 0x{arm9_entry_raw:x}) is not within a valid executable segment "
+                f"that starts at the expected load address 0x{arm9_load_addr:x}. "
+                f"Segment found: {segment_at_arm9_entry}. The _start9 symbol/entry point may not be effective or analysis may fail here."
             )
 
-        # arm7 entry point
+        # define arm7 entry point and symbol.
         arm7_load_addr = header.arm7_ram_address
-        entry_point_arm7 = header.arm7_entry_address
-        func_addr_aligned_arm7 = entry_point_arm7 & ~1
-        is_thumb_arm7 = (entry_point_arm7 & 1) != 0
+        arm7_entry_raw = header.arm7_entry_address
+        arm7_entry_aligned = arm7_entry_raw & ~1
+        # is_thumb_arm7 = (arm7_entry_raw & 1) != 0
 
-        segment_at_arm7_entry = self.get_segment_at(func_addr_aligned_arm7)
+        segment_at_arm7_entry = self.get_segment_at(arm7_entry_aligned)
         if (
             segment_at_arm7_entry
             and segment_at_arm7_entry.start == arm7_load_addr
             and segment_at_arm7_entry.executable
         ):
-            self.log.log_info(
-                f"defining arm7 entry point symbol: _start7 at 0x{func_addr_aligned_arm7:08x}{', thumb implied' if is_thumb_arm7 else ''}"
+            self.logger.log_info(
+                f"defining ARM7 entry point and symbol: _start7 at 0x{arm7_entry_aligned:08x} (raw entry from header: 0x{arm7_entry_raw:x})."
             )
-            self.add_entry_point(func_addr_aligned_arm7)
+            self.add_entry_point(
+                arm7_entry_aligned
+            )  # add as an additional entry point for analysis.
             self.define_auto_symbol(
-                Symbol(SymbolType.FunctionSymbol, func_addr_aligned_arm7, "_start7")
+                Symbol(SymbolType.FunctionSymbol, arm7_entry_aligned, "_start7")
             )
-            # self.add_function(func_addr_aligned_arm7) # removed: let analysis create it
+            if (
+                not primary_entry_defined_successfully
+            ):  # if arm9 entry definition failed, arm7 might be considered primary.
+                self._primary_entry_point_address = arm7_entry_aligned
+                primary_entry_defined_successfully = True
         else:
-            self.log.log_warn(
-                f"arm7 entry point 0x{func_addr_aligned_arm7:x} not in a valid executable segment starting at expected load address 0x{arm7_load_addr:x}. "
-                f"segment found: {segment_at_arm7_entry}. _start7 symbol/entry point may not be effective."
+            self.logger.log_warn(
+                f"ARM7 entry point 0x{arm7_entry_aligned:x} (raw 0x{arm7_entry_raw:x}) is not within a valid executable segment "
+                f"that starts at the expected load address 0x{arm7_load_addr:x}. "
+                f"Segment found: {segment_at_arm7_entry}. The _start7 symbol/entry point may not be effective."
             )
 
+        # handle debug rom info if present (usually for arm9 development/debugging).
         if header.debug_rom_offset != 0 and header.debug_size > 0:
+            # debug_ram_address might be 0 in header; use a common fallback if so.
             debug_load_addr = (
                 header.debug_ram_address
                 if header.debug_ram_address != 0
                 else 0x02400000
-            )  # common fallback
-            self.log.log_info(
-                f"debug arm9 seems present: rom_offset=0x{header.debug_rom_offset:x}, size=0x{header.debug_size:x}, load_addr=0x{debug_load_addr:08x}."
+            )  # a common fallback address for debug monitors.
+            self.logger.log_info(
+                f"debug ARM9 information present in header: ROM offset=0x{header.debug_rom_offset:x}, ROM size=0x{header.debug_size:x}. "
+                f"Intended RAM load address=0x{debug_load_addr:08x}. Note: This debug binary is not typically mapped by this loader by default."
             )
+            # this loader doesn't map the debug rom by default. just define a symbol indicating its intended load address.
             self.define_auto_symbol(
                 Symbol(
-                    SymbolType.DataSymbol, debug_load_addr, "arm9_debug_load_address"
+                    SymbolType.DataSymbol,
+                    debug_load_addr,
+                    "arm9_debug_intended_load_address",
                 )
             )
 
-    # --- main initialization logic ---
+        if not primary_entry_defined_successfully:
+            self.logger.log_error(
+                "failed to define any primary entry point for ARM9 or ARM7 based on header information and segment validation."
+            )
 
+    # - main initialization logic
     def init(self) -> bool:
         """
-        initializes the ndsview by parsing the header, mapping memory regions,
-        loading binaries, defining sections, symbols, and tags.
+        initializes the NDSView. this is the main setup method called by Binary Ninja
+        after `is_valid_for_data` returns true. it orchestrates parsing the NDS ROM
+        structure, mapping all memory regions, loading the ARM9 and ARM7 binaries
+        (including overlays), defining symbols and tags for hardware registers,
+        and setting the processor entry points.
+
         returns:
-            true on successful initialization, false otherwise.
+            true if initialization was successful and the view is ready for analysis, false otherwise.
         """
+        # architecture and platform should have been validated and set in __init__.
+        if not self.arch or not self.platform:
+            self.logger.log_error(
+                "critical: architecture or platform is not set. cannot initialize NDSView."
+            )
+            return False  # this should ideally not be reached if __init__ completed without raising.
+
         try:
-            self.log.log_info("starting nds rom loading process...")
+            self.logger.log_info(
+                f"starting NDS ROM loading process for '{self.file.filename}'..."
+            )
 
-            if not self._parse_rom_header():
-                self.log.log_error("initial rom header parsing failed. aborting init.")
-                return False  # ensure init fails if header parsing fails
+            # step 1: parse the entire nds rom file structure using the ndsromreader.
+            # this is a critical step that populates self.nds_rom_data.
+            if not self._parse_rom_file_structure():
+                self.logger.log_error(
+                    "initial NDS ROM parsing and validation failed. aborting NDSView initialization."
+                )
+                return False  # cannot proceed reliably if the rom structure is unknown or invalid.
 
-            self._define_tag_types()
+            # step 2: define all necessary tag types for nds specific elements (memory, hardware categories).
+            self._initialize_tag_types()
+
+            # step 3: map the general nds memory layout (bios, ram regions, i/o, vram, etc.) into segments.
             self._map_memory_regions()
 
-            self._load_arm9()
-            self._load_arm7()
-            if self.nds_rom:  # check again as it might be none if parsing failed badly
-                self._load_overlays("ARM9", self.nds_rom.arm9_overlay_table)
-                self._load_overlays("ARM7", self.nds_rom.arm7_overlay_table)
+            # step 4: load the arm9 and arm7 binaries and their overlays.
+            # these methods will handle decompression and map further segments for code/data/bss.
+            self._load_arm9_binary()
+            self._load_arm7_binary()
+            if (
+                self.nds_rom_data
+            ):  # ensure nds_rom_data is valid after parsing (it should be if _parse_rom_file_structure returned true).
+                self._load_overlays_for_cpu(
+                    "ARM9", self.nds_rom_data.arm9_overlay_table
+                )
+                self._load_overlays_for_cpu(
+                    "ARM7", self.nds_rom_data.arm7_overlay_table
+                )
+            else:  # should not happen if parsing succeeded.
+                self.logger.log_error(
+                    "nds_rom_data is unexpectedly None after successful parsing. cannot load binaries/overlays."
+                )
+                return False
 
-            self._define_io_registers()
-            self._define_entry_points()  # call after segments are loaded, defines symbols and entry points
+            # step 5: define symbols and tags for all known nds i/o registers.
+            self._define_all_io_registers()  # this will use the NDS_IO_REGISTERS list when populated.
 
-            self.log.log_info(
-                "nds rom loading complete. triggering analysis (background)..."
+            # step 6: define the rom's entry points for arm9 and arm7.
+            self._define_entry_points_and_symbols()
+
+            # note: self.update_analysis() or self.update_analysis_and_wait() is not called here.
+            # binary ninja's core will handle triggering the analysis passes after the loader's init() returns true.
+            self.logger.log_info(
+                "NDS ROM structure loaded and initial setup complete. Binary Ninja will now perform analysis."
             )
-            self.update_analysis()  # changed from update_analysis_and_wait() to avoid ui thread wait error
-            self.log.log_info(
-                "analysis update triggered. initial analysis will run in background."
-            )
-
-            return True
+            return True  # initialization successful
 
         except Exception as e:
-            log_error(f"[NDS] critical failure during ndsview initialization: {e}")
-            log_error(traceback.format_exc())
-            return False
+            # catch any unexpected errors during the entire initialization process.
+            self.logger.log_error(
+                f"a critical failure occurred during NDSView initialization: {e}\n{traceback.format_exc()}"
+            )
+            return False  # indicate failure to binary ninja.
 
-    # --- required binaryview methods ---
+    # - required binaryview method overrides
+    # these methods are part of the BinaryView plugin interface and must be implemented.
 
     def perform_is_executable(self) -> bool:
-        """nds roms contain executable code"""
+        """
+        indicates that NDS ROMs contain executable code for its processors.
+        """
+        self.logger.log_debug(
+            "perform_is_executable called, returning true for NDS ROM."
+        )
         return True
 
     def perform_get_entry_point(self) -> int:
-        """returns the primary (arm9) entry point address, or arm7 if arm9 is absent."""
-        # this is called by the core *after* init() completes.
-        # self.entry_points should exist if BinaryView.__init__ completed successfully.
-        if hasattr(self, "entry_points") and len(self.entry_points) > 0:
-            return self.entry_points[0]
+        """
+        returns the primary entry point address for the NDS ROM.
+        this is typically the ARM9 entry point. If that was not successfully
+        defined or is invalid, it might fall back to the ARM7 entry point or,
+        as a last resort, the start of the view or 0.
+        this method is called by the Binary Ninja core after `init()` completes.
+        """
+        if self._primary_entry_point_address is not None:
+            self.logger.log_debug(
+                f"perform_get_entry_point: returning stored primary entry point 0x{self._primary_entry_point_address:08x}."
+            )
+            return self._primary_entry_point_address
 
-        # fallback if self.entry_points wasn't populated or accessible (e.g. if init failed early)
-        self.log.log_warn(
-            "[NDS] perform_get_entry_point: self.entry_points not available or empty. attempting fallback to header values."
+        # fallback logic if _primary_entry_point_address wasn't set during init (e.g., due to issues).
+        self.logger.log_warn(
+            "[NDS] perform_get_entry_point: _primary_entry_point_address was not set during initialization. "
+            "Attempting fallback using parsed header values."
         )
-        if self.nds_rom and self.nds_rom.header:
-            # check arm9 entry first
-            arm9_entry_aligned = self.nds_rom.header.arm9_entry_address & ~1
-            segment_at_arm9_entry = self.get_segment_at(arm9_entry_aligned)
-            # check if a segment exists at the arm9 load address (where the entry point should be)
+        if self.nds_rom_data and self.nds_rom_data.header:
+            header = self.nds_rom_data.header
+            # try arm9 entry first as primary.
+            arm9_entry_aligned = header.arm9_entry_address & ~1
+            # check if a segment exists at the arm9 load address (where its entry point should reside).
+            seg_at_arm9_load = self.get_segment_at(header.arm9_ram_address)
             if (
-                segment_at_arm9_entry
-                and segment_at_arm9_entry.start == self.nds_rom.header.arm9_ram_address
+                seg_at_arm9_load
+                and seg_at_arm9_load.start == header.arm9_ram_address
+                and header.arm9_ram_address
+                <= arm9_entry_aligned
+                < header.arm9_ram_address + seg_at_arm9_load.length
             ):
-                self.log.log_info(
-                    "[NDS] perform_get_entry_point: using arm9_entry_address from header as fallback."
+                self.logger.log_info(
+                    "[NDS] perform_get_entry_point: using ARM9 entry address from header as fallback."
                 )
                 return arm9_entry_aligned
 
-            # then check arm7 entry
-            arm7_entry_aligned = self.nds_rom.header.arm7_entry_address & ~1
-            segment_at_arm7_entry = self.get_segment_at(arm7_entry_aligned)
+            # if arm9 entry is not valid or its segment isn't as expected, try arm7.
+            arm7_entry_aligned = header.arm7_entry_address & ~1
+            seg_at_arm7_load = self.get_segment_at(header.arm7_ram_address)
             if (
-                segment_at_arm7_entry
-                and segment_at_arm7_entry.start == self.nds_rom.header.arm7_ram_address
+                seg_at_arm7_load
+                and seg_at_arm7_load.start == header.arm7_ram_address
+                and header.arm7_ram_address
+                <= arm7_entry_aligned
+                < header.arm7_ram_address + seg_at_arm7_load.length
             ):
-                self.log.log_info(
-                    "[NDS] perform_get_entry_point: using arm7_entry_address as fallback (arm9 entry not valid/in segment)."
+                self.logger.log_info(
+                    "[NDS] perform_get_entry_point: using ARM7 entry address from header as fallback (ARM9 entry was not valid/in segment)."
                 )
                 return arm7_entry_aligned
 
-        self.log.log_error(
-            "[NDS] perform_get_entry_point: no valid entry points found from loader or header. returning start of view or 0."
+        # if all fallbacks fail, this indicates a significant issue with the ROM or loader logic.
+        self.logger.log_error(
+            "[NDS] perform_get_entry_point: no valid entry points found from loader's internal state or parsed header. "
+            "Returning start of view (0x{self.start:08x}) or 0 as a last resort. Analysis may be incorrect."
         )
-        return self.start if self.start is not None else 0
+        return self.start if self.start is not None else 0  # absolute last resort.
 
     def perform_get_address_size(self) -> int:
-        """nds uses 32-bit addresses"""
+        """
+        returns the address size for the NDS platform, which is 4 bytes (32-bit addresses)
+        for both its ARM9 and ARM7 processors.
+        """
+        self.logger.log_debug(
+            "perform_get_address_size called, returning 4 (for 32-bit addresses)."
+        )
         return 4
 
 
+# register the NDSView class with Binary Ninja so it can be used to open .nds files.
 NDSView.register()
