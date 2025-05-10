@@ -432,23 +432,11 @@ class GBAView(BinaryView):
     PERM_R: SegmentFlag = SegmentFlag.SegmentReadable
 
     def __init__(self, data: BinaryView):
-        """
-        initializes the GBAView instance.
-        this involves setting up the parent view (raw data), a dedicated logger,
-        and configuring the architecture and platform specific to GBA.
-
-        args:
-            data: the BinaryView object containing the raw GBA ROM data.
-                  this is typically the 'Raw' view of the file.
-        """
-        # initialize the base binaryview first, linking to the parent (raw) data.
-        BinaryView.__init__(self, parent_view=data, file_metadata=data.file)
-
+        super().__init__(file_metadata=data.file, parent_view=data)
         # store a reference to the raw data view for direct access if needed.
         self.raw_data: BinaryView = data
         # create a logger instance specific to this plugin for organized logging.
-        # BN.GBA helps distinguish logs from this plugin.
-        self.logger: Logger = self.create_logger(f"BN.{self.name}")
+        self.logger: Logger = self.create_logger(f"{self.name}")
         # cache for created tagtypes to avoid redundant api calls and improve performance.
         # keys are lowercase tag type names, values are the TagType objects.
         self._created_tag_types: Dict[str, TagType] = {}
