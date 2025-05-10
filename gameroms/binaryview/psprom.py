@@ -1283,9 +1283,9 @@ class PSPView(BinaryView):
         """
         indicates that psp elf files typically contain executable code.
         """
-        self.logger.log_debug(
-            "perform_is_executable called, returning true for PSP ELF."
-        )
+        # self.logger.log_debug(
+        #     "perform_is_executable called, returning true for PSP ELF."
+        # )
         return True
 
     def perform_get_entry_point(self) -> int:
@@ -1296,15 +1296,15 @@ class PSPView(BinaryView):
         this method is called by the binary ninja core after `init()` completes successfully.
         """
         if self._primary_entry_point_address is not None:
-            self.logger.log_debug(
-                f"perform_get_entry_point: returning stored primary entry point 0x{self._primary_entry_point_address:08x}."
-            )
+            # self.logger.log_debug(
+            #     f"perform_get_entry_point: returning stored primary entry point 0x{self._primary_entry_point_address:08x}."
+            # )
             return self._primary_entry_point_address
         elif (
             self.elf_header
         ):  # fallback if _primary_entry_point_address wasn't set but header was parsed (e.g., entry point validation failed)
             self.logger.log_warn(
-                "[PSP] perform_get_entry_point: _primary_entry_point_address was not set during init. "
+                "perform_get_entry_point: _primary_entry_point_address was not set during init. "
                 f"Falling back to e_entry directly from parsed ELF header (0x{self.elf_header.e_entry:08x})."
             )
             return self.elf_header.e_entry
@@ -1313,7 +1313,7 @@ class PSPView(BinaryView):
             # it indicates an issue in the loader's internal logic or a very early failure before header parsing.
             default_entry = self.start if self.start is not None else 0
             self.logger.log_error(
-                "[PSP] perform_get_entry_point called but no entry point was stored during initialization and ELF header is not available. "
+                "perform_get_entry_point called but no entry point was stored during initialization and ELF header is not available. "
                 f"Returning start of view (0x{default_entry:08x}) as a last resort. Analysis may be incorrect or start at an unexpected location."
             )
             return default_entry  # absolute last resort.
@@ -1322,9 +1322,9 @@ class PSPView(BinaryView):
         """
         returns the address size for the psp platform, which is 4 bytes (32-bit addresses).
         """
-        self.logger.log_debug(
-            "perform_get_address_size called, returning 4 (for 32-bit addresses)."
-        )
+        # self.logger.log_debug(
+        #     "perform_get_address_size called, returning 4 (for 32-bit addresses)."
+        # )
         return 4
 
 

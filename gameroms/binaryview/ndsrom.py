@@ -1724,9 +1724,9 @@ class NDSView(BinaryView):
         """
         indicates that NDS ROMs contain executable code for its processors.
         """
-        self.logger.log_debug(
-            "perform_is_executable called, returning true for NDS ROM."
-        )
+        # self.logger.log_debug(
+        #     "perform_is_executable called, returning true for NDS ROM."
+        # )
         return True
 
     def perform_get_entry_point(self) -> int:
@@ -1738,9 +1738,9 @@ class NDSView(BinaryView):
         this method is called by the Binary Ninja core after `init()` completes.
         """
         if self._primary_entry_point_address is not None:
-            self.logger.log_debug(
-                f"perform_get_entry_point: returning stored primary entry point 0x{self._primary_entry_point_address:08x}."
-            )
+            # self.logger.log_debug(
+            #     f"perform_get_entry_point: returning stored primary entry point 0x{self._primary_entry_point_address:08x}."
+            # )
             return self._primary_entry_point_address
 
         # fallback logic if _primary_entry_point_address wasn't set during init (e.g., due to issues).
@@ -1793,9 +1793,9 @@ class NDSView(BinaryView):
         returns the address size for the NDS platform, which is 4 bytes (32-bit addresses)
         for both its ARM9 and ARM7 processors.
         """
-        self.logger.log_debug(
-            "perform_get_address_size called, returning 4 (for 32-bit addresses)."
-        )
+        # self.logger.log_debug(
+        #     "perform_get_address_size called, returning 4 (for 32-bit addresses)."
+        # )
         return 4
 
 

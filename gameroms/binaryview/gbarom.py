@@ -1006,7 +1006,7 @@ class GBAView(BinaryView):
         """
         indicates that gba roms contain executable code.
         """
-        self.logger.log_debug("perform_is_executable called, returning true.")
+        # self.logger.log_debug("perform_is_executable called, returning true.")
         return True
 
     def perform_get_entry_point(self) -> int:
@@ -1015,9 +1015,9 @@ class GBAView(BinaryView):
         this is called by the binary ninja core after init() completes successfully.
         """
         if self._entry_point_address is not None:
-            self.logger.log_debug(
-                f"perform_get_entry_point called, returning stored entry point 0x{self._entry_point_address:08x}."
-            )
+            # self.logger.log_debug(
+            #     f"perform_get_entry_point called, returning stored entry point 0x{self._entry_point_address:08x}."
+            # )
             return self._entry_point_address
         else:
             # this case should ideally not be reached if init() succeeded and defined an entry point.
@@ -1032,7 +1032,7 @@ class GBAView(BinaryView):
         """
         returns the address size for gba, which is 4 bytes (32-bit addresses).
         """
-        self.logger.log_debug("perform_get_address_size called, returning 4 (32-bit).")
+        # self.logger.log_debug("perform_get_address_size called, returning 4 (32-bit).")
         return 4  # gba uses 32-bit addressing
 
 
