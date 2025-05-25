@@ -18,13 +18,13 @@ from binaryninja import (
 )
 from binaryninja.log import Logger
 
-from ..readers.nds_cartridge import (
+from .cartridge import (
     NDSRomReader,
     NDSRom,
     NDSOverlayTable,
     NDSOverlayEntry,
 )
-from ..defs.nds import NDS_IO_REGISTERS
+from .defs import NDS_IO_REGISTERS
 
 # - nds hardware definitions
 

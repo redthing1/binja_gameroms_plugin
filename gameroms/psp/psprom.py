@@ -21,7 +21,7 @@ from binaryninja import (
 from binaryninja.log import Logger
 
 # io definitions for psp hardware registers.
-from ..defs.psp import PSP_IO_REGISTERS
+from .defs import PSP_IO_REGISTERS
 
 # - elf constants
 # these constants define the structure and magic values for elf (executable and linkable format) files,
