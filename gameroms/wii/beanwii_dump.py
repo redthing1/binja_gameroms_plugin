@@ -204,8 +204,8 @@ class BeanWiiDumpView(BinaryView):
                 )
                 return False
 
-            # entry point is a 4-byte big-endian unsigned integer immediately following the magic bytes.
-            entry_point_raw = struct.unpack_from(">I", header_data, MAGIC_SIZE)[0]
+            # entry point is a 4-byte little-endian unsigned integer immediately following the magic bytes.
+            entry_point_raw = struct.unpack_from("I", header_data, MAGIC_SIZE)[0]
 
             self.parsed_header = BeanDumpHeader(
                 magic=magic, entry_point=entry_point_raw
