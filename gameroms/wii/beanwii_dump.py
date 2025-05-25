@@ -1,4 +1,3 @@
-# PATH: gameroms/wii/wiirom.py
 import struct
 import traceback
 from typing import Optional, Dict, List
@@ -82,8 +81,8 @@ FALLBACK_DEFAULT_ENTRY_POINT = 0x80003F00
 # - dataclass for parsed header information
 @dataclass
 class BeanDumpHeader:
-    magic: bytes = b""
-    entry_point: int = 0
+    magic: bytes = b""  # magic bytes, should be WII_DUMP_MAGIC
+    entry_point: int = 0  # entry point address, 4-byte LE unsigned integer
 
 
 class BeanWiiDumpView(BinaryView):
@@ -205,7 +204,7 @@ class BeanWiiDumpView(BinaryView):
                 return False
 
             # entry point is a 4-byte little-endian unsigned integer immediately following the magic bytes.
-            entry_point_raw = struct.unpack_from("I", header_data, MAGIC_SIZE)[0]
+            entry_point_raw = struct.unpack_from("<I", header_data, MAGIC_SIZE)[0]
 
             self.parsed_header = BeanDumpHeader(
                 magic=magic, entry_point=entry_point_raw
@@ -307,6 +306,10 @@ class BeanWiiDumpView(BinaryView):
             )
 
         # hollywood i/o registers (main 32kb block: 0xcd000000 - 0xcd007fff)
+        # note: some registers like mem_prot are outside this main block but still in 0xcdxxxxxx range.
+        # this segment covers the primary contiguous block. individual registers outside will still be defined
+        # if their addresses fall into other (potentially smaller, specific) segments or if we expand this.
+        # for now, this maps the main documented block.
         self.add_auto_segment(
             HOLLYWOOD_IO_BASE_ADDR, HOLLYWOOD_IO_SIZE, 0, 0, self.PERM_RW
         )
@@ -320,6 +323,31 @@ class BeanWiiDumpView(BinaryView):
         if tag_hwio:
             self.add_tag(
                 HOLLYWOOD_IO_BASE_ADDR, tag_hwio.name, "Hollywood I/O Block Start"
+            )
+
+        # mem_prot registers are at 0xcd0bxxxx, which is outside the main 0xcd000000 - 0xcd007fff block.
+        # we need a segment for them. they are sparse.
+        # let's create a small segment just for these known MEM_PROT registers.
+        # the highest MEM_PROT related register is 0xCD0B422A (16-bit, so ends at 0xCD0B422B).
+        # the lowest is 0xCD0B420A.
+        # a segment from 0xCD0B4200 to 0xCD0B42FF (256 bytes) should cover them.
+        mem_prot_segment_base = 0xCD0B4200
+        mem_prot_segment_size = 0x100  # 256 bytes
+        self.add_auto_segment(
+            mem_prot_segment_base, mem_prot_segment_size, 0, 0, self.PERM_RW
+        )
+        self.set_comment_at(
+            mem_prot_segment_base,
+            "Wii MEM_PROT Registers Area (Hollywood I/O Extension)",
+        )
+        tag_mem_iface = self._get_or_create_tag_type(
+            "Memory Interface", WII_TAG_TYPE_DEFINITIONS.get("Memory Interface", "🧠")
+        )
+        if tag_mem_iface:
+            self.add_tag(
+                mem_prot_segment_base,
+                tag_mem_iface.name,
+                "MEM_PROT Registers Area Start",
             )
 
         # boot rom / ipl alias (e.g., 0xfff00000 - 0xffffffff, typically 1mb for powerpc boot rom area)
@@ -474,43 +502,41 @@ class BeanWiiDumpView(BinaryView):
         self.logger.log_info("finished mapping dumped memory segments.")
 
     def _define_hardware_register(
-        self, address: int, name: str, tag_category_name: str, description: str
+        self,
+        address: int,
+        name: str,
+        tag_category_name: str,
+        description: str,
+        size_bits: int,
     ):
+        c_type_base = ""
+        if size_bits == 8:
+            c_type_base = "uint8_t"
+        elif size_bits == 16:
+            c_type_base = "uint16_t"
+        elif size_bits == 32:
+            c_type_base = "uint32_t"
+        else:
+            # default to uint32_t for unknown or unsupported sizes, with a warning.
+            self.logger.log_warn(
+                f"unsupported size_bits {size_bits} for register '{name}' at 0x{address:08x}. defaulting to uint32_t."
+            )
+            c_type_base = "uint32_t"  # fallback type
+            size_bits = 32  # ensure consistency for type parser
+
         # memory-mapped i/o registers should generally be typed as 'volatile'
-        # to ensure the compiler does not optimize away accesses.
-        # wii hardware registers are typically 32-bit.
-        mmio_type_declaration = f"volatile uint32_t {name}_reg_type;"
+        mmio_type_declaration = f"volatile {c_type_base} {name}_reg_type;"
 
         # determine if this register likely qualifies as mmio based on its tag category.
         # this heuristic can be refined if more specific type information is available per register.
+        # for wii_io_registers, they are all mmio.
         is_mmio_heuristic = (
-            "register" in tag_category_name.lower()  # general catch-all
-            or tag_category_name
-            in [  # specific known mmio categories
-                "Hollywood Register",
-                "Hardware Register",
-                "I2C",
-                "EXI",
-                "Drive Interface",
-                "Audio Interface",
-                "Processor Interface",
-                "Memory Interface",
-                "Timer",
-                "Video Interface",
-                "GPIO",
-                "PLL/Clock",
-                "OTP",
-                "USB",
-                "NAND/Flash",
-                "Bus Control",
-            ]
+            True  # all entries from WII_IO_REGISTERS are considered mmio
         )
 
         self.define_auto_symbol(Symbol(SymbolType.DataSymbol, address, name))
         if description:
-            self.set_comment_at(
-                address, description
-            )  # use proper casing for ui comments
+            self.set_comment_at(address, description)
 
         if is_mmio_heuristic:
             try:
@@ -520,7 +546,7 @@ class BeanWiiDumpView(BinaryView):
                     if self.get_data_var_at(address) is None:
                         self.define_user_data_var(address, parsed_type)
                         self.logger.log_debug(
-                            f"  defined mmio register '{name}' at 0x{address:08x} as volatile uint32_t."
+                            f"  defined mmio register '{name}' at 0x{address:08x} as volatile {c_type_base}."
                         )
                     else:
                         self.logger.log_debug(
@@ -532,7 +558,7 @@ class BeanWiiDumpView(BinaryView):
                     )
             except Exception as e:
                 self.logger.log_warn(
-                    f"failed to define mmio register '{name}' as volatile uint32_t: {e}"
+                    f"failed to define mmio register '{name}' as volatile {c_type_base}: {e}"
                 )
 
         tag_icon = WII_TAG_TYPE_DEFINITIONS.get(tag_category_name, "🔩")  # default icon
@@ -555,14 +581,15 @@ class BeanWiiDumpView(BinaryView):
             return
 
         defined_count = 0
-        for addr, name, tag_category, desc in WII_IO_REGISTERS:
+        for addr, name, tag_category, desc, size_bits in WII_IO_REGISTERS:
             segment = self.get_segment_at(addr)
             if segment and (segment.readable or segment.writable):
                 self.logger.log_debug(
-                    f"  defining i/o register: {name} at 0x{addr:08x} (category: {tag_category})"
+                    f"  defining i/o register: {name} at 0x{addr:08x} (category: {tag_category}, size: {size_bits}-bit)"
                 )
-                # _define_hardware_register now handles applying 'volatile' type for mmio
-                self._define_hardware_register(addr, name, tag_category, desc)
+                self._define_hardware_register(
+                    addr, name, tag_category, desc, size_bits
+                )
                 defined_count += 1
             else:
                 self.logger.log_debug(
@@ -592,7 +619,7 @@ class BeanWiiDumpView(BinaryView):
                 )
                 self.define_auto_symbol(Symbol(SymbolType.DataSymbol, addr, name))
                 if desc:
-                    self.set_comment_at(addr, desc)  # use proper casing for ui comments
+                    self.set_comment_at(addr, desc)
 
                 tag_icon = WII_TAG_TYPE_DEFINITIONS.get(tag_category, "🌍")
                 tag_type_obj = self._get_or_create_tag_type(tag_category, tag_icon)
@@ -609,16 +636,24 @@ class BeanWiiDumpView(BinaryView):
                         # assumes type_str is either a base type (e.g. "uint32_t") or a full declarator (e.g. "char[4]").
                         # if it's just a base type, a dummy variable name is appended for the parser.
                         c_decl_for_parsing = (
-                            f"{type_str} {name}_global_var_type;"  # use a distinct temp name
+                            f"{type_str} {name}_global_var_type;"
                             if " " not in type_str
                             and "[" not in type_str
                             and "*" not in type_str
                             and "(" not in type_str  # heuristic for base type
-                            else type_str  # assume it's already a declarator or function type
+                            else type_str
                         )
                         # ensure it ends with a semicolon for the parser
                         if not c_decl_for_parsing.strip().endswith(";"):
                             c_decl_for_parsing += ";"
+
+                        # for function pointer types like "void()", we need to declare it as a pointer
+                        if type_str.endswith("()") and not type_str.startswith("(*"):
+                            # e.g. "void()" -> "void (*my_func_ptr_type)();"
+                            base_return_type = type_str[:-2]
+                            c_decl_for_parsing = (
+                                f"{base_return_type} (*{name}_func_ptr_type)();"
+                            )
 
                         parsed_type, _ = self.parse_type_string(c_decl_for_parsing)
                         if parsed_type:
