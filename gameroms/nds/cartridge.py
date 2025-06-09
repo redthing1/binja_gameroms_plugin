@@ -6,6 +6,10 @@ import traceback  # import traceback for error logging
 from dataclasses import dataclass, field  # import field for default_factory
 from typing import List, Optional, Dict, TYPE_CHECKING, Tuple  # added tuple
 
+# CRC and validation constants
+CRC16_CCITT_POLY = 0x1021  # CRC-16-CCITT polynomial
+NINTENDO_LOGO_CRC = 0xCF56  # Standard Nintendo logo CRC
+
 # use binaryninja logging if available, otherwise fallback to print
 try:
     from binaryninja import log_error, log_warn, log_info
@@ -661,7 +665,7 @@ class NDSRomReader:
 
         # check nintendo logo crc
         try:
-            logo_crc_expected = 0xCF56  # standard logo crc is fixed
+            logo_crc_expected = NINTENDO_LOGO_CRC
             logo_crc_actual = struct.unpack_from("<H", header_data, 0x15C)[0]
             if logo_crc_actual != logo_crc_expected:
                 log_warn(
@@ -690,7 +694,7 @@ class NDSRomReader:
     def _crc16(data: bytes) -> int:
         """calculates the crc-16/ccitt-false used in nds headers."""
         crc = 0xFFFF
-        poly = 0x1021  # crc-16-ccitt polynomial
+        poly = CRC16_CCITT_POLY
         for byte in data:
             crc ^= byte << 8
             for _ in range(8):

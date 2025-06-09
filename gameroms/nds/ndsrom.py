@@ -71,12 +71,12 @@ class NDSView(BaseROMLoader):
         try:
             # NDS uses ARM946E-S (ARMv5TEJ) and ARM7TDMI (ARMv4T)
             # ARMv7 is used as a practical choice that supports both instruction sets
-            self.arch: Optional[Architecture] = Architecture["armv7"]  # type: ignore
+            self.arch: Architecture | None = Architecture["armv7"]
             if not self.arch:
                 self.logger.log_error("critical: armv7 architecture not found in binary ninja")
                 raise RuntimeError("armv7 architecture definition not found")
 
-            self.platform: Optional[Platform] = self.arch.standalone_platform
+            self.platform: Platform | None = self.arch.standalone_platform
             if not self.platform:
                 self.logger.log_error(f"critical: could not get platform for {self.arch.name}")
                 raise RuntimeError(f"failed to get platform for {self.arch.name}")
@@ -152,8 +152,8 @@ class NDSView(BaseROMLoader):
         self.logger.log_info("parsing full nds rom structure using ndsromreader.read()...")
         try:
             self.nds_rom = NDSRomReader.read(rom_data_bytes)
-        except Exception as e:
-            self.logger.log_error(f"ndsromreader.read() failed with an exception: {e}")
+        except (ValueError, struct.error, AttributeError) as e:
+            self.logger.log_error(f"ndsromreader.read() failed: {e}")
             self.logger.log_error(f"traceback:\n{traceback.format_exc()}")
             self.nds_rom = None
             del rom_data_bytes
@@ -190,7 +190,8 @@ class NDSView(BaseROMLoader):
         ):
             """Helper to add NDS memory segments with consistent logging and tagging."""
             self.logger.log_debug(
-                f"  preparing to map '{name}': addr=0x{address:08x}, size=0x{size:x} ({size // 1024}KB)"
+                f"Preparing to map '{name}': addr=0x{address:08x}, "
+                f"size=0x{size:x} ({size // 1024}KB)"
             )
 
             file_offset_for_backing = 0
@@ -316,7 +317,21 @@ class NDSView(BaseROMLoader):
 
     def _mii_uncompress_backward(self, data: bytes) -> bytes:
         """
-        Decompress data assumed to be in a MII LZ77 variant format (backward decompression).
+        Decompress data using MII LZ77 variant format with backward decompression.
+        
+        This method implements the specific LZ77 decompression algorithm used by
+        Nintendo DS ROMs for compressed ARM9/ARM7 binaries and overlays.
+        
+        Args:
+            data: Compressed data bytes including 8-byte footer with size information
+            
+        Returns:
+            Decompressed data as bytes
+            
+        Raises:
+            ValueError: If data format is invalid or decompression parameters are malformed
+            EOFError: If source data is exhausted during decompression
+            IndexError: If copy operations would exceed buffer bounds
         """
         if len(data) < 4:
             raise ValueError("data too short for mii decompression (minimum 4 bytes for footer)")
@@ -517,7 +532,8 @@ class NDSView(BaseROMLoader):
                         max_reasonable_decomp_size = rom_size * 25
                         if not (0 <= sdk_derived_code_data_size_in_memory <= max_reasonable_decomp_size):
                             self.logger.log_error(
-                                f"  moduleparams: invalid sdk_derived_code_data_size (0x{sdk_derived_code_data_size_in_memory:x})"
+                                f"Moduleparams: invalid sdk_derived_code_data_size "
+                                f"(0x{sdk_derived_code_data_size_in_memory:x})"
                             )
                             is_compressed_by_sdk_params = False
                         elif sdk_derived_code_data_size_in_memory == 0 and is_compressed_by_sdk_params:

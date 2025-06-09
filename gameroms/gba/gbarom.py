@@ -71,17 +71,19 @@ class GBAView(BaseROMLoader):
     def _setup_architecture_and_platform(self) -> None:
         """Set up self.arch and self.platform for GBA ROMs."""
         try:
-            self.arch: Optional[Architecture] = Architecture["armv7"]  # type: ignore
+            self.arch: Architecture | None = Architecture["armv7"]
             if not self.arch:
                 self.logger.log_error(
-                    "critical: armv7 architecture definition not found in binary ninja. GBA analysis requires it."
+                    "Critical: armv7 architecture definition not found in Binary Ninja. "
+                    "GBA analysis requires it."
                 )
                 raise RuntimeError("armv7 architecture definition not found.")
 
-            self.platform: Optional[Platform] = self.arch.standalone_platform
+            self.platform: Platform | None = self.arch.standalone_platform
             if not self.platform:
                 self.logger.log_error(
-                    f"critical: could not get standalone platform for architecture '{self.arch.name}'. GBA analysis cannot proceed."
+                    f"Critical: could not get standalone platform for architecture "
+                    f"'{self.arch.name}'. GBA analysis cannot proceed."
                 )
                 raise RuntimeError(f"failed to get standalone platform for {self.arch.name}.")
             

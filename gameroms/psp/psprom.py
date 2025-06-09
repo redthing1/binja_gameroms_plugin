@@ -96,8 +96,8 @@ class PSPView(BaseROMLoader):
     def _setup_architecture_and_platform(self) -> None:
         """Set up self.arch and self.platform for PSP ELFs."""
         # The PSP uses a MIPS III-based Allegrex CPU, which is a 32-bit little-endian MIPS processor
-        selected_arch: Optional[Architecture] = None
-        selected_platform: Optional[Platform] = None
+        selected_arch: Architecture | None = None
+        selected_platform: Platform | None = None
 
         # Prioritize 'mipsel32' as it explicitly denotes little-endian MIPS 32-bit
         arch_candidates = ["mipsel32", "mips32"]

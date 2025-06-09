@@ -63,7 +63,7 @@ class BaseROMLoader(BinaryView, ABC):
         """Set up self.arch and self.platform for this ROM type."""
         pass
 
-    def _get_or_create_tag_type(self, name: str, icon: str) -> Optional[TagType]:
+    def _get_or_create_tag_type(self, name: str, icon: str) -> TagType | None:
         """
         Retrieves an existing tag type by its name or creates a new one if it doesn't exist.
         Results are cached to avoid redundant API calls and improve performance.
@@ -93,7 +93,7 @@ class BaseROMLoader(BinaryView, ABC):
             new_tag_type = self.create_tag_type(name, icon)
             self._created_tag_types[name_lower] = new_tag_type
             return new_tag_type
-        except Exception as e:
+        except (AttributeError, ValueError, RuntimeError) as e:
             self.logger.log_error(f"Failed to create tag type '{name}': {e}")
             return None
 
@@ -127,9 +127,12 @@ class BaseROMLoader(BinaryView, ABC):
         
         Args:
             address: The memory-mapped I/O address of the hardware register
-            name: The conventional name for the register symbol
-            tag_category_name: The category name of the tag type
+            name: The conventional name for the register symbol  
+            tag_category_name: The category name of the tag type (must exist in tag_type_definitions)
             description: An optional comment to add for the register at its address
+            
+        Raises:
+            (AttributeError, ValueError, RuntimeError): If symbol definition or tag application fails
         """
         try:
             # Define the symbol for the register
@@ -150,7 +153,7 @@ class BaseROMLoader(BinaryView, ABC):
                 self.logger.log_warn(
                     f"Could not obtain tag type '{tag_category_name}' for register '{name}' at 0x{address:08x}"
                 )
-        except Exception as e:
+        except (AttributeError, ValueError, RuntimeError) as e:
             self.logger.log_error(
                 f"Error processing hardware register '{name}' at 0x{address:08x}: {e}\n{traceback.format_exc()}"
             )
