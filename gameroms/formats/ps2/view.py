@@ -31,11 +31,14 @@ from .parse import (
     ET_REL,
     EF_MIPS_ARCH_1,
     EF_MIPS_ARCH_MASK,
+    E_MIPS_MACH_5900,
     PF_R,
     PF_W,
     PF_X,
     PT_LOAD,
     SHT_DYNSYM,
+    SHT_DVP_OVERLAY,
+    SHT_DVP_OVERLAY_TABLE,
     SHT_NOBITS,
     SHT_REL,
     SHT_RELA,
@@ -379,6 +382,15 @@ class Ps2EeView(Ps2ViewBase):
             return False
         if header.e_machine != EM_MIPS:
             return False
+        # prefer the EE-specific machine variant flag; fallback to DVP section types
+        if (header.e_flags & E_MIPS_MACH_5900) != E_MIPS_MACH_5900:
+            has_dvp_section = False
+            for sh in read_section_headers(raw, header):
+                if sh.sh_type in (SHT_DVP_OVERLAY_TABLE, SHT_DVP_OVERLAY):
+                    has_dvp_section = True
+                    break
+            if not has_dvp_section:
+                return False
         if header.e_type in (ET_IRX, ET_IRX2, ET_ERX2):
             return False
         if header.e_type not in (ET_EXEC, ET_REL, ET_DYN):
@@ -473,7 +485,7 @@ class Ps2IopView(Ps2ViewBase):
         has_iop_addr = any(looks_iop_addr(a) for a in addrs)
         is_arch1 = (header.e_flags & EF_MIPS_ARCH_MASK) == EF_MIPS_ARCH_1
 
-        return has_iop_section or (is_arch1 and has_iop_addr) or has_iop_addr
+        return has_iop_section or (is_arch1 and has_iop_addr)
 
     def _map_system_memory(self) -> None:
         regions = ps2_iop_regions()
