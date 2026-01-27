@@ -17,3 +17,8 @@ Supports a lot of major consoles now.
 ## usage
 
 see [guides](./doc) for platform-specific instructions.
+
+> for some consoles, the raw cartridge data can be quite huge.
+> for those, instead of directly importing the cartridge, we use scripts (see guide) to pack only the executable and its metadata into a single file.
+> the loader then loads this file and maps it into the binaryview.
+> at the cost of having a slightly nonstandard format, we now are very space efficient, as we load only the executable data and still map it neatly into virtual address space.
