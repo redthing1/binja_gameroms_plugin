@@ -1,5 +1,5 @@
-from binaryninja import *
+from binaryninja import *  # noqa: F401,F403
 
-from .gameroms.nds import ndsrom
-from .gameroms.gba import gbarom
-from .gameroms.psp import psprom
+from .gameroms.formats.gba.view import GbaView  # noqa: F401
+from .gameroms.formats.nds.view import NdsArm9View, NdsArm7View  # noqa: F401
+from .gameroms.formats import psp  # noqa: F401
