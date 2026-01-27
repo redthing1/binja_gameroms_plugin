@@ -14,3 +14,8 @@ extract NCA containing game files:
 ```
 
 look for executable: `main`
+
+create NXEXE (`.nxexe`) for analysis:
+```sh
+python ./tools/exefs_to_nxexe.py -i /path/to/exefs
+```
