@@ -360,13 +360,13 @@ class NdsViewBase(BaseRomView):
 
 class NdsArm9View(NdsViewBase):
     name = "NDS ARM9"
-    long_name = "Nintendo DS ROM (ARM9)"
+    long_name = "DS ROM (ARM9)"
     cpu_name = "ARM9"
 
 
 class NdsArm7View(NdsViewBase):
     name = "NDS ARM7"
-    long_name = "Nintendo DS ROM (ARM7)"
+    long_name = "DS ROM (ARM7)"
     cpu_name = "ARM7"
 
 

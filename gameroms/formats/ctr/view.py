@@ -23,7 +23,7 @@ CXIEXE_VERSION = 1
 
 class CtrCxiExeView(BaseRomView):
     name = "3DS CXI"
-    long_name = "Nintendo 3DS CXI Executable"
+    long_name = "3DS CXI Executable"
 
     @classmethod
     def is_valid_for_data(cls, data) -> bool:

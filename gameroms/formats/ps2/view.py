@@ -364,7 +364,7 @@ class Ps2ViewBase(BaseRomView):
 
 class Ps2EeView(Ps2ViewBase):
     name = "PS2 EE ELF"
-    long_name = "PlayStation 2 ELF (EE)"
+    long_name = "PS2 ELF (EE)"
     arch_name = "r5900l"
     cpu_name = "EE"
     entry_symbol = "ps2_ee_entry"
@@ -429,7 +429,7 @@ class Ps2EeView(Ps2ViewBase):
 
 class Ps2IopView(Ps2ViewBase):
     name = "PS2 IOP ELF"
-    long_name = "PlayStation 2 ELF (IOP)"
+    long_name = "PS2 ELF (IOP)"
     arch_name = "mipsel32"
     cpu_name = "IOP"
     entry_symbol = "ps2_iop_entry"

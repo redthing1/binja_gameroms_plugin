@@ -11,7 +11,7 @@ from .parse import is_valid_gba, parse_header
 
 class GbaView(BaseRomView):
     name = "GBA"
-    long_name = "Game Boy Advance ROM"
+    long_name = "GBA ROM"
 
     @classmethod
     def is_valid_for_data(cls, data) -> bool:
