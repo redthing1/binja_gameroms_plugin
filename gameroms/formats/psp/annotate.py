@@ -51,6 +51,10 @@ class PspRegion:
 
 
 def _is_psp_elf(bv: BinaryView) -> bool:
+    if bv.view_type != "ELF":
+        return False
+    if bv.arch is None or "mips" not in bv.arch.name:
+        return False
     raw = bv.parent_view or bv
     if raw.length < ELF_HEADER_SIZE:
         return False
@@ -72,7 +76,14 @@ def _is_psp_elf(bv: BinaryView) -> bool:
         e_machine = struct.unpack_from("<H", header, 18)[0]
     except struct.error:
         return False
-    return e_machine == EM_MIPS
+    if e_machine != EM_MIPS:
+        return False
+    for section_name in bv.sections:
+        if section_name in (".sceModuleInfo", ".rodata.sceModuleInfo"):
+            return True
+    if bv.get_symbol_by_name("sceModuleInfo"):
+        return True
+    return False
 
 
 def _segments_overlap(bv: BinaryView, start: int, length: int) -> bool:
