@@ -73,6 +73,9 @@ class RelHeader:
             return 0x48
         return 0x4C
 
+    def full_size(self) -> int:
+        return self.size() + self.section_count * 8
+
 
 @dataclass
 class RelModule:

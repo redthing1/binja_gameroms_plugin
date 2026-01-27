@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from binaryninja import (
     Architecture,
@@ -8,13 +9,17 @@ from binaryninja import (
     SegmentFlag,
     Symbol,
     SymbolType,
+    Type,
     log_error,
 )
 
 from ...core.tags import add_tag
 from ...core.view_base import BaseRomView
 from .constants import WIIEXE_HEADER_STRUCT, WIIEXE_MAGIC, WIIEXE_VERSION
+from .demangle import demangle_codewarrior
 from .dol import DolParseError, parse_dol
+from .layout import WII_REGIONS
+from .mmio import WII_GLOBAL_SYMBOLS, WII_MMIO_REGISTERS
 from .rel import RelParseError, apply_rel_relocations, parse_rel
 from .rso import RsoParseError, apply_rso_relocations, parse_rso, RsoSection
 
@@ -47,6 +52,8 @@ class WiiExeView(BaseRomView):
 
             self.arch = Architecture["ppc_ps"]
             self.platform = self.arch.standalone_platform
+
+            self._apply_system_regions()
 
             modules = meta.get("modules", [])
             dol_mod = next((m for m in modules if m.get("type") == "dol"), None)
@@ -85,6 +92,11 @@ class WiiExeView(BaseRomView):
             for mod, rso in rso_modules:
                 self._map_rso(mod, rso, blob_offset)
 
+            for mod in modules:
+                symbols = mod.get("symbols")
+                if symbols:
+                    self._apply_symbol_map(symbols)
+
             # Apply REL relocations
             for _, rel in rel_modules:
                 apply_rel_relocations(self, rel, modules_by_id)
@@ -104,6 +116,129 @@ class WiiExeView(BaseRomView):
         except Exception as exc:
             log_error(f"[WIIEXE] init failed: {exc}")
             return False
+
+    def _apply_symbol_map(self, symbols: list[dict]) -> None:
+        for sym in symbols:
+            if sym.get("is_sub"):
+                continue
+            addr = sym.get("addr")
+            if addr is None:
+                continue
+            seg = self.get_segment_at(addr)
+            if seg is None:
+                continue
+            raw_name = sym.get("name", "")
+            if not raw_name:
+                continue
+            container = sym.get("container", "")
+            demangled = demangle_codewarrior(raw_name)
+            short_name = demangled.name if demangled else raw_name
+            namespace_parts: list[str] = []
+            if container:
+                namespace_parts.append(Path(container).stem)
+            if demangled and demangled.namespace:
+                namespace_parts.extend(demangled.namespace)
+            full_name = (
+                "::".join(namespace_parts + [short_name])
+                if namespace_parts
+                else short_name
+            )
+
+            sym_type = SymbolType.DataSymbol
+            if seg.executable and int(sym.get("size", 0)) >= 4:
+                sym_type = SymbolType.FunctionSymbol
+
+            self.define_user_symbol(
+                Symbol(
+                    sym_type,
+                    addr,
+                    short_name,
+                    full_name=full_name if full_name != short_name else None,
+                    raw_name=raw_name,
+                )
+            )
+            if sym_type == SymbolType.FunctionSymbol:
+                if self.get_function_at(addr) is None:
+                    self.create_user_function(addr)
+
+    def _parse_global_type(self, type_str: str | None) -> Type | None:
+        if not type_str:
+            return None
+        s = type_str.strip()
+        if not s:
+            return None
+        if s.endswith("()"):
+            return Type.function(Type.void(), [])
+
+        array_count = None
+        if "[" in s and s.endswith("]"):
+            base, _, rest = s.partition("[")
+            try:
+                array_count = int(rest[:-1], 10)
+            except ValueError:
+                array_count = None
+            s = base.strip()
+
+        pointer_levels = 0
+        while s.endswith("*"):
+            pointer_levels += 1
+            s = s[:-1].strip()
+
+        base_map = {
+            "uint8_t": Type.int(1, sign=False),
+            "uint16_t": Type.int(2, sign=False),
+            "uint32_t": Type.int(4, sign=False),
+            "uint64_t": Type.int(8, sign=False),
+            "int8_t": Type.int(1, sign=True),
+            "int16_t": Type.int(2, sign=True),
+            "int32_t": Type.int(4, sign=True),
+            "int64_t": Type.int(8, sign=True),
+            "char": Type.int(1, sign=False),
+            "void": Type.void(),
+        }
+        base_type = base_map.get(s)
+        if base_type is None:
+            return None
+
+        while pointer_levels:
+            base_type = Type.pointer(self.arch, base_type)
+            pointer_levels -= 1
+
+        if array_count is not None:
+            base_type = Type.array(base_type, array_count)
+
+        return base_type
+
+    def _apply_system_regions(self) -> None:
+        self.map_regions(WII_REGIONS)
+        for region in WII_REGIONS:
+            tag_type = "MMIO" if region.section_type == "MMIO" else "Region"
+            add_tag(self, region.vaddr, tag_type, region.name)
+
+        for reg in WII_MMIO_REGISTERS:
+            if self.get_segment_at(reg.addr) is None:
+                continue
+            self.define_mmio_register(reg)
+
+        for sym in WII_GLOBAL_SYMBOLS:
+            if self.get_segment_at(sym.addr) is None:
+                continue
+            if sym.is_function or (sym.type_str and sym.type_str.endswith("()")):
+                self.define_user_symbol(
+                    Symbol(SymbolType.FunctionSymbol, sym.addr, sym.name)
+                )
+                if self.get_function_at(sym.addr) is None:
+                    self.create_user_function(sym.addr)
+            else:
+                sym_type = self._parse_global_type(sym.type_str)
+                if sym_type is not None:
+                    self.define_data_var(sym.addr, sym_type, sym.name)
+                else:
+                    self.define_user_symbol(
+                        Symbol(SymbolType.DataSymbol, sym.addr, sym.name)
+                    )
+            if sym.description:
+                self.set_comment_at(sym.addr, sym.description)
 
     def _map_dol(self, mod: dict, dol_info, blob_offset: int) -> None:
         base_file_off = blob_offset + mod["blob_offset"]
