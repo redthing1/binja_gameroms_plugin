@@ -11,3 +11,7 @@ Binary Ninja loader for some game ROMs.
 + [ ] planned: Wii (Nintendo Wii) binary (`powerpc`)
 + [x] load: PS2 (PlayStation 2) ELF (`r5900l`)
 + [x] load: 3DS (Nintendo 3DS) binary (`armv5`/`armv6`)
+
+## usage
+
+see [guides](./doc) for platform-specific instructions.
