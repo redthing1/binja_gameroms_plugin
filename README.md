@@ -12,7 +12,7 @@ Supports a lot of major consoles now.
 + [x] PS2 (PlayStation 2) ELF (`r5900l`)
 + [x] 3DS (Nintendo 3DS) CXI ([guide](doc/guide_3ds.md)) (`armv5`/`armv6`)
 + [x] Switch (Nintendo Switch) NSO0 ([guide](doc/guide_switch.md)) (`aarch64`)
-+ [x] Wii (Nintendo Wii) Executable (`ppc_ps`)
++ [x] Wii (Nintendo Wii) Executable ([guide](doc/guide_wii.md)) (`ppc_ps`)
 
 ## usage
 
