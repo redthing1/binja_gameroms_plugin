@@ -1,3 +1,7 @@
+/notes
+/temp
+/old
+
 *.pyc
 .vscode
 *.tmp
