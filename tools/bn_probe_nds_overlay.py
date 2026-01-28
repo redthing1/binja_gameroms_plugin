@@ -32,7 +32,7 @@ def main() -> int:
 
     import gameroms.formats.nds.view  # noqa: F401
     from gameroms.formats.nds.decompress import mii_uncompress_backward
-    from gameroms.formats.nds.parse import read_nds
+    from gameroms.formats.nds.model import read_nds_image
 
     view_type = BinaryViewType[args.view]
     if view_type is None:
@@ -49,39 +49,29 @@ def main() -> int:
         if raw is None:
             print("no parent view")
             return 4
-        nds = read_nds(raw)
+        nds = read_nds_image(raw)
         if nds is None:
             print("failed to parse nds header")
             return 5
-        table = (
-            nds.arm9_overlay_table if "ARM9" in args.view else nds.arm7_overlay_table
-        )
-        if table is None:
-            print("no overlay table")
-            return 6
+        overlays = nds.arm9_overlays if "ARM9" in args.view else nds.arm7_overlays
         entry = None
-        for ent in table.entries:
+        for ent in overlays:
             if ent.overlay_id == args.overlay_id:
                 entry = ent
                 break
         if entry is None:
-            if args.overlay_id < len(table.entries):
-                entry = table.entries[args.overlay_id]
-            else:
-                print("overlay id not found")
-                return 7
-        if entry.file_id >= len(nds.fat_entries):
-            print("overlay file_id out of FAT bounds")
-            return 8
-        fat = nds.fat_entries[entry.file_id]
-        rom_size = max(0, fat.end_address - fat.start_address)
-        raw_data = raw.read(fat.start_address, rom_size) if rom_size > 0 else b""
+            print("overlay id not found")
+            return 7
+
+        raw_data = raw.read(entry.file_start, entry.file_size) if entry.file_size > 0 else b""
         data = raw_data
         if entry.is_compressed and raw_data:
             data = mii_uncompress_backward(raw_data)
-        effective_size = len(data) if data else entry.ram_size
+        effective_size = entry.ram_size if entry.ram_size > 0 else len(data)
         read_len = min(args.length, effective_size)
+
         mem_bytes = bv.read(entry.ram_address, read_len)
+
         file_bytes = data[:read_len]
         print(f"view: {args.view}")
         print(f"overlay_id: {entry.overlay_id}")

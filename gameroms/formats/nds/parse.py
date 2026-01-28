@@ -57,6 +57,7 @@ class NdsOverlayEntry:
     static_initializer_end_address: int
     file_id: int
     flags: int
+    compressed_offset: int
     is_compressed: bool
     has_auth_code: bool
 
@@ -97,7 +98,9 @@ def is_valid_nds(data: BinaryView) -> bool:
         header_crc = struct.unpack_from("<H", header, 0x15E)[0]
     except struct.error:
         return False
-    return logo_crc == crc16(header[0xC0:0x15C]) and header_crc == crc16(header[0:0x15E])
+    return logo_crc == crc16(header[0xC0:0x15C]) and header_crc == crc16(
+        header[0:0x15E]
+    )
 
 
 def parse_header(data: BinaryView) -> Optional[NdsHeader]:
@@ -128,7 +131,9 @@ def parse_header(data: BinaryView) -> Optional[NdsHeader]:
         return None
 
 
-def read_overlay_table(raw: BinaryView, offset: int, size: int) -> Optional[NdsOverlayTable]:
+def read_overlay_table(
+    raw: BinaryView, offset: int, size: int
+) -> Optional[NdsOverlayTable]:
     if offset == 0 or size == 0:
         return None
     if offset + size > raw.length:
@@ -148,6 +153,8 @@ def parse_overlay_table(data: bytes) -> Optional[NdsOverlayTable]:
         base = i * entry_size
         try:
             flags = struct.unpack_from("<I", data, base + 28)[0]
+            flag_byte = (flags >> 24) & 0xFF
+            compressed_offset = flags & 0x00FFFFFF
             entries.append(
                 NdsOverlayEntry(
                     overlay_id=struct.unpack_from("<I", data, base + 0)[0],
@@ -162,8 +169,9 @@ def parse_overlay_table(data: bytes) -> Optional[NdsOverlayTable]:
                     )[0],
                     file_id=struct.unpack_from("<I", data, base + 24)[0],
                     flags=flags,
-                    is_compressed=bool(flags & 0x1),
-                    has_auth_code=bool(flags & 0x2),
+                    compressed_offset=compressed_offset,
+                    is_compressed=bool(flag_byte & 0x1),
+                    has_auth_code=bool(flag_byte & 0x2),
                 )
             )
         except struct.error as exc:
@@ -198,10 +206,19 @@ def read_nds(raw: BinaryView) -> Optional[NdsRom]:
     header = parse_header(raw)
     if header is None:
         return None
-    arm9_ovt = read_overlay_table(raw, header.arm9_overlay_offset, header.arm9_overlay_size)
-    arm7_ovt = read_overlay_table(raw, header.arm7_overlay_offset, header.arm7_overlay_size)
+    arm9_ovt = read_overlay_table(
+        raw, header.arm9_overlay_offset, header.arm9_overlay_size
+    )
+    arm7_ovt = read_overlay_table(
+        raw, header.arm7_overlay_offset, header.arm7_overlay_size
+    )
     fat_entries = read_fat(raw, header.fat_offset, header.fat_size)
-    return NdsRom(header=header, arm9_overlay_table=arm9_ovt, arm7_overlay_table=arm7_ovt, fat_entries=fat_entries)
+    return NdsRom(
+        header=header,
+        arm9_overlay_table=arm9_ovt,
+        arm7_overlay_table=arm7_ovt,
+        fat_entries=fat_entries,
+    )
 
 
 def find_module_params(data: bytes) -> Optional[int]:
