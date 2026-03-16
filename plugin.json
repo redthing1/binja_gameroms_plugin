@@ -3,7 +3,7 @@
   "name": "Game ROM Loader",
   "description": "Game ROM Loader for Binary Ninja",
   "author": "redthing1",
-  "version": "0.2.0",
+  "version": "0.2.4",
   "minimumBinaryNinjaVersion": 3164,
   "type": [
     "core",
