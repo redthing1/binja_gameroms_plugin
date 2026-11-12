@@ -7,3 +7,4 @@ from .gameroms.formats.nx.view import SwitchNxExeView  # noqa: F401
 from .gameroms.formats.wii.view import WiiExeView  # noqa: F401
 from .gameroms.formats import psp  # noqa: F401
 from .gameroms.formats import ps2  # noqa: F401
+from .gameroms.formats.ps3.view import Ps3ElfView, Ps3ExeView  # noqa: F401
